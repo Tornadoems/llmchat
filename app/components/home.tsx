@@ -488,14 +488,14 @@ function Screen() {
     );
   }
 
-  const requiresAuth = accessStore.enabledAccessControl();
+  const pageAccessControlEnabled = accessStore.isPageAccessControlEnabled();
   const isAuthorized = accessStore.isAuthorized();
 
   if (checkingAccess) {
     return <Loading />;
   }
 
-  if (requiresAuth && !isAuthorized) {
+  if (pageAccessControlEnabled && !isAuthorized) {
     return (
       <AccessGate
         accessCode={accessStore.accessCode}
@@ -584,7 +584,7 @@ export function Home() {
   const configReady = accessStore.configLoaded;
   const canLoadProtectedData =
     configReady &&
-    (!accessStore.enabledAccessControl() || accessStore.isAuthorized());
+    (!accessStore.isPageAccessControlEnabled() || accessStore.isAuthorized());
 
   useLoadData(canLoadProtectedData);
 

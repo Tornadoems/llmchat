@@ -14,7 +14,7 @@
       "providers": {
         "openai": {
           "apiKey": "ah-ced0395da",
-          "baseUrl": "http://192.168.123.179:9010"
+          "baseUrl": "http://192.168.0.1:9010"
         }
       },
       "mcpServers": {
@@ -47,7 +47,7 @@
       "providers": {
         "openai": {
           "apiKey": "ah-ced03955634",
-          "baseUrl": "http://192.168.123.179:9009"
+          "baseUrl": "http://192.168.0.1:9009"
         }
       },
       "mcpServers": {}

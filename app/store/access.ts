@@ -187,6 +187,9 @@ const DEFAULT_ACCESS_STATE = {
   defaultModel: "",
   visionModels: "",
 
+  // 是否启用整页访问控制（AccessGate）
+  accessControlEnabled: false,
+
   // 是否设置了服务器端访问码
   hasServerAccessCode: false,
   configLoaded: false,
@@ -289,6 +292,7 @@ const DEFAULT_ACCESS_STATE = {
 };
 
 export type AccessControlStore = typeof DEFAULT_ACCESS_STATE & {
+  isPageAccessControlEnabled: () => boolean;
   enabledAccessControl: () => boolean;
   getVisionModels: () => string;
   edgeVoiceName: () => string;
@@ -343,9 +347,13 @@ export const useAccessStore = createPersistStore(
   { ...DEFAULT_ACCESS_STATE },
 
   (set, get) => ({
+    isPageAccessControlEnabled() {
+      this.fetch();
+      return get().accessControlEnabled;
+    },
     enabledAccessControl() {
       this.fetch();
-      // 仅当服务器设置了访问码时启用访问控制
+      // 仅用于服务端 provider 是否仍需访问码解锁
       return get().hasServerAccessCode;
     },
     getVisionModels() {

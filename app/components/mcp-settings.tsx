@@ -142,6 +142,27 @@ function sanitizeDomId(input: string) {
   return input.replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
+function areClientStatusesEqual(
+  left: Record<string, ServerStatusResponse>,
+  right: Record<string, ServerStatusResponse>,
+) {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+
+  if (leftKeys.length !== rightKeys.length) return false;
+
+  return leftKeys.every((key) => {
+    const leftStatus = left[key];
+    const rightStatus = right[key];
+
+    return (
+      !!rightStatus &&
+      leftStatus.status === rightStatus.status &&
+      leftStatus.errorMsg === rightStatus.errorMsg
+    );
+  });
+}
+
 export function MCPSettings() {
   const appConfig = useAppConfig();
   const [config, setConfig] = useState<McpConfigData>({ mcpServers: {} });
@@ -169,7 +190,9 @@ export function MCPSettings() {
       getClientsStatus(),
     ]);
     setConfig(mcpConfig);
-    setClientStatuses(statuses);
+    setClientStatuses((prev) =>
+      areClientStatusesEqual(prev, statuses) ? prev : statuses,
+    );
     setExpandedServers((prev) => {
       const nextExpanded: Record<string, boolean> = {};
       Object.keys(mcpConfig.mcpServers).forEach((serverId) => {
@@ -219,7 +242,11 @@ export function MCPSettings() {
   useEffect(() => {
     const timer = setInterval(() => {
       void getClientsStatus()
-        .then(setClientStatuses)
+        .then((statuses) => {
+          setClientStatuses((prev) =>
+            areClientStatusesEqual(prev, statuses) ? prev : statuses,
+          );
+        })
         .catch(() => {});
     }, 1500);
 

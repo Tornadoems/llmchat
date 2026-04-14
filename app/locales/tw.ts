@@ -459,6 +459,10 @@ const tw = {
         Title: "存取密碼",
         SubTitle: "管理員已開啟加密存取",
         Placeholder: "請輸入存取密碼",
+        Apply: "套用",
+        ApplySuccessToast: "存取密碼已套用，正在重新整理設定",
+        InvalidToast: "存取密碼無效",
+        FetchFailedToast: "取得伺服器設定失敗",
       },
       CustomEndpoint: {
         Title: "自訂 API 端點 (Endpoint)",

@@ -872,6 +872,8 @@ export function Settings() {
     });
   }, [accessStore.customProviders]);
 
+  const [applyingAccessCode, setApplyingAccessCode] = useState(false);
+
   useEffect(() => {
     // checks per minutes
     checkUpdate();
@@ -898,21 +900,55 @@ export function Settings() {
   }, []);
 
   const clientConfig = useMemo(() => getClientConfig(), []);
-  const showAccessCode = enabledAccessControl && !clientConfig?.isApp;
+  const showAccessCode = accessStore.hasServerAccessCode && !clientConfig?.isApp;
+
+  const handleApplyAccessCode = async () => {
+    const trimmedCode = accessStore.accessCode.trim();
+    if (!trimmedCode || applyingAccessCode) return;
+
+    try {
+      setApplyingAccessCode(true);
+      const isValid = await accessStore.verifyServerAccessCode(trimmedCode);
+      if (!isValid) {
+        showToast(Locale.Settings.Access.AccessCode.InvalidToast);
+        return;
+      }
+
+      const loaded = await accessStore.fetchServerConfig(trimmedCode);
+      if (!loaded) {
+        showToast(Locale.Settings.Access.AccessCode.FetchFailedToast);
+        return;
+      }
+
+      showToast(Locale.Settings.Access.AccessCode.ApplySuccessToast);
+      // window.location.reload();
+    } finally {
+      setApplyingAccessCode(false);
+    }
+  };
 
   const accessCodeComponent = showAccessCode && (
     <ListItem
       title={Locale.Settings.Access.AccessCode.Title}
       subTitle={Locale.Settings.Access.AccessCode.SubTitle}
     >
-      <PasswordInput
-        value={accessStore.accessCode}
-        type="text"
-        placeholder={Locale.Settings.Access.AccessCode.Placeholder}
-        onChange={(e) => {
-          accessStore.updateAccessCode(e.currentTarget.value);
-        }}
-      />
+      <div className={styles["access-code-row"]}>
+        <PasswordInput
+          value={accessStore.accessCode}
+          type="text"
+          placeholder={Locale.Settings.Access.AccessCode.Placeholder}
+          onChange={(e) => {
+            accessStore.updateAccessCode(e.currentTarget.value);
+          }}
+        />
+        <IconButton
+          text={Locale.Settings.Access.AccessCode.Apply}
+          type="primary"
+          className={styles["access-code-apply"]}
+          onClick={handleApplyAccessCode}
+          disabled={!accessStore.accessCode.trim() || applyingAccessCode}
+        />
+      </div>
     </ListItem>
   );
 

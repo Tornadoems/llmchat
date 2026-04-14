@@ -25,6 +25,7 @@ async function getServerConfig() {
     customModels: "",
     defaultModel: bootstrap?.defaultModel || "",
     visionModels: "",
+    accessControlEnabled: controlStatus.accessControlEnabled,
     hasServerAccessCode: controlStatus.hasServerAccessCode,
     hasServerProviderConfig:
       bootstrap?.hasServerProviderConfig ||

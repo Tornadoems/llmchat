@@ -450,6 +450,10 @@ const en: LocaleType = {
         SubTitle:
           "Access control is enabled. ‘SERVER’ badge means the server has provided an API key for that provider via environment variables. After entering a valid access code, you can use those providers directly without filling API keys here.",
         Placeholder: "Enter Code",
+        Apply: "Apply",
+        ApplySuccessToast: "Access code applied, refreshing config",
+        InvalidToast: "Invalid access code",
+        FetchFailedToast: "Failed to fetch server config",
       },
       CustomEndpoint: {
         Title: "Custom Endpoint",

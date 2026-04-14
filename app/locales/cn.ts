@@ -438,6 +438,10 @@ const cn = {
         SubTitle:
           "已启用访问控制。带有 “SERVER” 标识表示后端已为该服务商配置了 API Key（通过环境变量）。输入正确访问码后，可直接使用这些服务商，无需在此填写 API Key。",
         Placeholder: "请输入访问密码",
+        Apply: "应用",
+        ApplySuccessToast: "访问密码已应用，刷新配置",
+        InvalidToast: "访问密码无效",
+        FetchFailedToast: "获取服务端配置失败",
       },
       CustomEndpoint: {
         Title: "自定义接口",

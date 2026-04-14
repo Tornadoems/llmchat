@@ -82,6 +82,7 @@ const ACCESS_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const ACCESS_SESSION_SECRET_ENV = "ACCESS_SESSION_SECRET";
 const ACCESS_GROUPS_DIR_ENV = "ACCESS_GROUPS_DIR";
 const ACCESS_GROUPS_FILE_ENV = "ACCESS_GROUPS_FILE";
+const ACCESS_CONTROL_ENABLED_ENV = "ACCESS_CONTROL_ENABLED";
 const DEFAULT_ACCESS_GROUPS_DIR = "/app/data";
 const DEFAULT_ACCESS_GROUPS_FILE = "access-groups.json";
 
@@ -321,11 +322,32 @@ export async function loadAccessGroups() {
   };
 }
 
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean) {
+  const normalized = (value || "").trim().toLowerCase();
+  if (!normalized) return defaultValue;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
+export function isAccessControlEnabled() {
+  return parseBooleanEnv(process.env[ACCESS_CONTROL_ENABLED_ENV], false);
+}
+
+export async function getDefaultAccessGroup() {
+  const { groups, legacyGroup } = await loadAccessGroups();
+  return groups[0] || legacyGroup || null;
+}
+
 export async function getAccessControlStatus() {
   const { groups, legacyGroup } = await loadAccessGroups();
+  const hasConfiguredAccessCode =
+    groups.some((group) => !!group.accessCode) || !!legacyGroup?.accessCode;
+  const enabled = isAccessControlEnabled() && hasConfiguredAccessCode;
   return {
-    hasServerAccessCode:
-      groups.some((group) => !!group.accessCode) || !!legacyGroup?.accessCode,
+    accessControlEnabled: enabled,
+    hasServerAccessCode: hasConfiguredAccessCode,
+    hasConfiguredAccessCode,
     hasLegacyAccessCode: !!legacyGroup?.accessCode,
     hasAccessGroupsConfig: groups.length > 0,
   };

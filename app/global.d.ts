@@ -18,6 +18,7 @@ type DangerConfig = {
   customModels: string;
   defaultModel: string;
   visionModels: string;
+  accessControlEnabled?: boolean;
   hasServerAccessCode: boolean;
   hasServerProviderConfig: boolean;
   accessMode?: "legacy" | "group";

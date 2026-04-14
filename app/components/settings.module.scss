@@ -177,6 +177,39 @@
   resize: vertical;
 }
 
+.access-code-row {
+  width: min(420px, 100%);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 10px;
+
+  :global(.password-input-container) {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    display: flex;
+    justify-content: stretch;
+  }
+
+  :global(.password-input) {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+}
+
+.access-code-apply {
+  width: auto;
+  min-width: 72px;
+  min-height: 36px;
+  padding: 0 16px;
+  border-radius: 10px;
+  align-self: stretch;
+  white-space: nowrap;
+}
+
 .mcp-form-item :global(.ui-lib_list-header__RwThu) {
   flex: 1;
   min-width: 0;
@@ -456,6 +489,7 @@
     input[type="text"],
     input[type="number"],
     textarea,
+    .access-code-row,
     .mcp-inline-value,
     .mcp-empty-inline,
     .mcp-tool-actions {
