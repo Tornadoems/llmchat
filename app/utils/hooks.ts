@@ -2,6 +2,23 @@ import { useMemo } from "react";
 import { useAccessStore, useAppConfig } from "../store";
 import { collectModelsWithDefaultModel } from "./model";
 import { LLMModel } from "../client/api";
+import { ServiceProvider } from "../constant";
+
+function getBuiltinProviderId(providerName: string) {
+  const providerIdMap: Record<string, string> = {
+    [ServiceProvider.OpenAI]: "openai",
+    [ServiceProvider.Google]: "google",
+    [ServiceProvider.Anthropic]: "anthropic",
+    [ServiceProvider.ByteDance]: "bytedance",
+    [ServiceProvider.Alibaba]: "alibaba",
+    [ServiceProvider.Moonshot]: "moonshot",
+    [ServiceProvider.XAI]: "xai",
+    [ServiceProvider.DeepSeek]: "deepseek",
+    [ServiceProvider.SiliconFlow]: "siliconflow",
+  };
+
+  return providerIdMap[providerName] || providerName.toLowerCase();
+}
 
 export function useAllModels() {
   const accessStore = useAccessStore();
@@ -128,6 +145,33 @@ export function useEnabledModels() {
           }
         });
       }
+
+      // 兜底补入启用但暂未出现在静态表/API 返回中的模型，避免首次应用访问码时默认模型丢失
+      providerEnabledModels.forEach((modelName) => {
+        const exists = result.some(
+          (existingModel) =>
+            existingModel.name === modelName &&
+            existingModel.provider?.providerName === providerName,
+        );
+
+        if (exists) {
+          return;
+        }
+
+        result.push({
+          name: modelName,
+          displayName: modelName,
+          available: true,
+          isDefault: accessStore.defaultModel === modelName,
+          provider: {
+            id: getBuiltinProviderId(providerName),
+            providerName,
+            providerType: "openai",
+            sorted: 1,
+          },
+          sorted: 1,
+        } as LLMModel);
+      });
     });
 
     // 处理自定义服务商

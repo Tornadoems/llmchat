@@ -20,6 +20,7 @@ import { ensure } from "../utils/clone";
 import { DEFAULT_CONFIG } from "./config";
 import { getModelProvider } from "../utils/model";
 import { clearGroupMcpServers, setGroupMcpServers } from "./mcp";
+import { useAppConfig } from "./config";
 
 // 自定义服务商类型定义
 export type CustomProviderType = "openai" | "google" | "anthropic";
@@ -57,6 +58,67 @@ type GroupBootstrap = {
   serverProviders: Record<string, ServerProviderFlags>;
   hasServerProviderConfig: boolean;
 };
+
+function resolveBootstrapProviderName(
+  defaultModel: string,
+  bootstrapDefaultProvider?: string,
+): ServiceProvider {
+  const providerKeyToService: Record<string, ServiceProvider> = {
+    openai: ServiceProvider.OpenAI,
+    google: ServiceProvider.Google,
+    anthropic: ServiceProvider.Anthropic,
+    bytedance: ServiceProvider.ByteDance,
+    alibaba: ServiceProvider.Alibaba,
+    moonshot: ServiceProvider.Moonshot,
+    xai: ServiceProvider.XAI,
+    deepseek: ServiceProvider.DeepSeek,
+    siliconflow: ServiceProvider.SiliconFlow,
+  };
+
+  const [, detectedProvider] = getModelProvider(defaultModel);
+  if (detectedProvider) {
+    const normalized = providerKeyToService[detectedProvider.toLowerCase()];
+    if (normalized) return normalized;
+
+    if (
+      Object.values(ServiceProvider).includes(detectedProvider as ServiceProvider)
+    ) {
+      return detectedProvider as ServiceProvider;
+    }
+  }
+
+  const providerFromBootstrap = bootstrapDefaultProvider
+    ? providerKeyToService[bootstrapDefaultProvider.toLowerCase()]
+    : undefined;
+
+  return providerFromBootstrap || ServiceProvider.OpenAI;
+}
+
+function syncBootstrapModelConfig(
+  defaultModel: string,
+  providerName: ServiceProvider,
+  summaryModel?: string,
+) {
+  if (!defaultModel && !summaryModel) {
+    return;
+  }
+
+  const appConfigStore = useAppConfig.getState();
+  const [resolvedDefaultModel] = getModelProvider(defaultModel);
+  const [resolvedSummaryModel] = getModelProvider(summaryModel || "");
+
+  appConfigStore.update((config) => {
+    if (defaultModel) {
+      config.modelConfig.model = resolvedDefaultModel as any;
+      config.modelConfig.providerName = providerName as any;
+    }
+
+    if (summaryModel) {
+      config.modelConfig.compressModel = resolvedSummaryModel;
+      config.modelConfig.compressProviderName = providerName as any;
+    }
+  });
+}
 
 let fetchState = 0; // 0 not fetch, 1 fetching, 2 done
 
@@ -739,10 +801,16 @@ export const useAccessStore = createPersistStore(
       const defaultModel = bootstrap.defaultModel || "";
       let providerName = isSameGroup ? get().provider : ServiceProvider.OpenAI;
       if (defaultModel) {
-        const [, detectedProvider] = getModelProvider(defaultModel);
         providerName = isSameGroup
-          ? get().provider || (detectedProvider as ServiceProvider)
-          : (detectedProvider as ServiceProvider);
+          ? get().provider ||
+            resolveBootstrapProviderName(
+              defaultModel,
+              bootstrap.defaultProvider,
+            )
+          : resolveBootstrapProviderName(
+              defaultModel,
+              bootstrap.defaultProvider,
+            );
       } else if (bootstrap.defaultProvider) {
         providerName =
           providerKeyToService[bootstrap.defaultProvider] ||
@@ -758,9 +826,23 @@ export const useAccessStore = createPersistStore(
             : providerName;
       }
 
-      if (defaultModel && !isSameGroup) {
-        DEFAULT_CONFIG.modelConfig.model = getModelProvider(defaultModel)[0];
-        DEFAULT_CONFIG.modelConfig.providerName = providerName;
+      if (!isSameGroup) {
+        if (defaultModel) {
+          DEFAULT_CONFIG.modelConfig.model = getModelProvider(defaultModel)[0];
+          DEFAULT_CONFIG.modelConfig.providerName = providerName;
+        }
+
+        if (bootstrap.summaryModel) {
+          DEFAULT_CONFIG.modelConfig.compressModel =
+            getModelProvider(bootstrap.summaryModel)[0];
+          DEFAULT_CONFIG.modelConfig.compressProviderName = providerName;
+        }
+
+        syncBootstrapModelConfig(
+          defaultModel,
+          providerName,
+          bootstrap.summaryModel,
+        );
       }
 
       setGroupMcpServers(
@@ -951,7 +1033,11 @@ export const useAccessStore = createPersistStore(
         .then((res) => {
           const defaultModel = res.defaultModel ?? "";
           if (defaultModel !== "") {
-            const [model, providerName] = getModelProvider(defaultModel);
+            const model = getModelProvider(defaultModel)[0];
+            const providerName = resolveBootstrapProviderName(
+              defaultModel,
+              (res as any)?.groupBootstrap?.defaultProvider,
+            );
             DEFAULT_CONFIG.modelConfig.model = model;
             DEFAULT_CONFIG.modelConfig.providerName = providerName as any;
           }

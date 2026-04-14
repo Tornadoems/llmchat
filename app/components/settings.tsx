@@ -921,7 +921,6 @@ export function Settings() {
       }
 
       showToast(Locale.Settings.Access.AccessCode.ApplySuccessToast);
-      // window.location.reload();
     } finally {
       setApplyingAccessCode(false);
     }
