@@ -56,6 +56,7 @@ import MenuIcon from "../icons/menu.svg";
 import {
   BOT_HELLO,
   ChatMessage,
+  ChatMessageSegment,
   ChatSession,
   createMessage,
   DEFAULT_TOPIC,
@@ -76,6 +77,8 @@ import { estimateTokenLength } from "../utils/token";
 
 import {
   autoGrowTextArea,
+  createAttachmentTextSegment,
+  getMessageAttachments,
   copyToClipboard,
   getMessageImages,
   getMessageTextContent,
@@ -87,18 +90,19 @@ import {
   supportsCustomSize,
   useMobileScreen,
   selectOrCopy,
-  isThinkingModel,
-  wrapThinkingPart,
 } from "../utils";
+import { getTextContentFromSegments } from "../utils/thinking";
 
-import { uploadImage as uploadImageRemote } from "@/app/utils/chat";
+import { compressImage, readFileAsText } from "@/app/utils/chat";
 
 import dynamic from "next/dynamic";
+import { Collapse } from "antd";
 
 import { ChatControllerPool } from "../client/controller";
 import { DalleQuality, DalleStyle, ModelSize } from "../typing";
 import { Prompt, usePromptStore } from "../store/prompt";
 import Locale from "../locales";
+import { getMcpDisplayName } from "../mcp/display";
 
 import { IconButton } from "./button";
 import styles from "./chat.module.scss";
@@ -133,7 +137,7 @@ import { prettyObject } from "../utils/format";
 import { ExportMessageModal } from "./exporter";
 import { getClientConfig } from "../config/client";
 import { useEnabledModels } from "../utils/hooks";
-import { ClientApi, MultimodalContent } from "../client/api";
+import { ChatAttachment, ClientApi, MultimodalContent } from "../client/api";
 import { createTTSPlayer } from "../utils/audio";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "../utils/ms_edge_tts";
 
@@ -148,17 +152,73 @@ import {
   isWebSearchModel,
 } from "../config/model-capabilities";
 import { ProviderIcon } from "./provider-icon";
+import { Markdown, ThoughtSegmentBlock } from "./markdown";
 
 const localStorage = safeLocalStorage();
 
 const ttsPlayer = createTTSPlayer();
 
-const Markdown = dynamic(async () => (await import("./markdown")).Markdown, {
-  loading: () => <LoadingIcon />,
-});
+function buildUserMessageContent(
+  input: string,
+  attachments: ChatAttachment[],
+): string | MultimodalContent[] {
+  if (attachments.length === 0) {
+    return input;
+  }
+
+  const content: MultimodalContent[] = [];
+
+  if (input.trim().length > 0) {
+    content.push({ type: "text", text: input });
+  }
+
+  for (const attachment of attachments) {
+    if (attachment.type === "image") {
+      content.push({
+        type: "image_url",
+        image_url: { url: attachment.data },
+      });
+    } else {
+      content.push({
+        type: "text",
+        text: createAttachmentTextSegment(attachment.name, attachment.data),
+      });
+    }
+  }
+
+  return content;
+}
+
+async function buildAttachmentFromFile(file: File): Promise<ChatAttachment> {
+  const id = `${file.name}-${file.size}-${file.lastModified}`;
+  const mimeType = file.type || "application/octet-stream";
+
+  if (mimeType.startsWith("image/")) {
+    const data = await compressImage(file, 1024 * 1024);
+    return {
+      id,
+      type: "image",
+      name: file.name,
+      mimeType,
+      data,
+      previewUrl: data,
+    };
+  }
+
+  const data = await readFileAsText(file);
+  return {
+    id,
+    type: "text",
+    name: file.name,
+    mimeType,
+    data,
+  };
+}
 
 const MCPAction = ({ onTogglePanel }: { onTogglePanel: () => void }) => {
   const [count, setCount] = useState<number>(0);
+  const config = useAppConfig();
+  const mcpEnabled = config.mcpEnabled;
 
   useEffect(() => {
     const updateCount = async () => {
@@ -174,6 +234,7 @@ const MCPAction = ({ onTogglePanel }: { onTogglePanel: () => void }) => {
       text={`MCP${count ? ` (${count})` : ""}`}
       icon={<McpToolIcon />}
       dataAttribute="data-mcp-button"
+      active={mcpEnabled}
     />
   );
 };
@@ -206,6 +267,481 @@ const MultiModelAction = ({ onToggle }: { onToggle: () => void }) => {
 interface MCPClient {
   clientId: string;
   tools: any;
+}
+
+function ToolResultCard(props: { tool: any; defaultOpen?: boolean }) {
+  const { tool, defaultOpen } = props;
+  const isRunning = tool.isError !== true && tool.isError !== false;
+  const [activeKeys, setActiveKeys] = useState<string[]>(
+    defaultOpen ? ["tool"] : [],
+  );
+
+  useEffect(() => {
+    setActiveKeys(defaultOpen ? ["tool"] : []);
+  }, [defaultOpen, tool.id, tool.isError]);
+
+  const statusText = isRunning
+    ? Locale.Chat.MCP.Running
+    : tool.isError
+    ? Locale.Chat.MCP.Failed
+    : Locale.Chat.MCP.Done;
+  const headerTitle = `${getMcpDisplayName(tool.clientId)} : ${
+    tool.displayName || tool?.function?.name || ""
+  }`;
+  const argsText =
+    tool.argumentsObj && Object.keys(tool.argumentsObj).length > 0
+      ? JSON.stringify(tool.argumentsObj, null, 2)
+      : Locale.Chat.MCP.EmptyArguments;
+  const getReadableResponse = () => {
+    const raw = tool.response ?? tool.content ?? tool.errorMsg ?? "";
+    if (Array.isArray(raw)) {
+      if (raw.length === 1 && raw[0]?.type === "text" && raw[0]?.text) {
+        return raw[0].text;
+      }
+      return JSON.stringify(raw, null, 2);
+    }
+    if (
+      raw &&
+      typeof raw === "object" &&
+      Array.isArray(raw.content) &&
+      raw.content.length === 1 &&
+      raw.content[0]?.type === "text" &&
+      raw.content[0]?.text
+    ) {
+      return raw.content[0].text;
+    }
+    if (typeof raw === "string") {
+      return raw;
+    }
+    try {
+      return JSON.stringify(raw, null, 2);
+    } catch {
+      return String(raw);
+    }
+  };
+  const responseText = getReadableResponse();
+  const formatBlock = (value: string) => {
+    if (!value) return value;
+    try {
+      return `\`\`\`json\n${JSON.stringify(
+        JSON.parse(value),
+        null,
+        2,
+      )}\n\`\`\``;
+    } catch {
+      return `\`\`\`\n${value}\n\`\`\``;
+    }
+  };
+
+  return (
+    <div className={styles["chat-tool-card"]}>
+      <Collapse
+        bordered={false}
+        size="small"
+        activeKey={activeKeys}
+        onChange={(keys) =>
+          setActiveKeys(
+            Array.isArray(keys)
+              ? (keys as string[])
+              : keys
+              ? [keys as string]
+              : [],
+          )
+        }
+        className={styles["chat-tool-collapse"]}
+        items={[
+          {
+            key: "tool",
+            label: (
+              <div className={styles["chat-tool-header"]}>
+                <div className={styles["chat-tool-title"]}>
+                  <span>{headerTitle}</span>
+                  <span
+                    className={clsx(styles["chat-tool-status-icon"], {
+                      [styles["success"]]: tool.isError === false,
+                      [styles["error"]]: tool.isError === true,
+                    })}
+                  >
+                    {tool.isError === false ? (
+                      <ConfirmIcon />
+                    ) : tool.isError === true ? (
+                      <CloseIcon />
+                    ) : (
+                      <LoadingButtonIcon />
+                    )}
+                  </span>
+                </div>
+                <div className={styles["chat-tool-actions"]}>
+                  <span
+                    className={clsx(styles["chat-tool-status"], {
+                      [styles["success"]]: tool.isError === false,
+                      [styles["error"]]: tool.isError === true,
+                    })}
+                  >
+                    {statusText}
+                  </span>
+                  <button
+                    className={styles["chat-tool-copy"]}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      copyToClipboard(responseText || argsText);
+                    }}
+                    aria-label={Locale.Chat.Actions.Copy}
+                    type="button"
+                  >
+                    <CopyIcon />
+                  </button>
+                </div>
+              </div>
+            ),
+            children: (
+              <div className={styles["chat-tool-body"]}>
+                <div className={styles["chat-tool-section"]}>
+                  <div className={styles["chat-tool-section-title"]}>
+                    {Locale.Chat.MCP.Arguments}
+                  </div>
+                  <Markdown
+                    content={formatBlock(argsText)}
+                    loading={false}
+                    fontSize={14}
+                    fontFamily="inherit"
+                    defaultShow={true}
+                    status={false}
+                  />
+                </div>
+                <div className={styles["chat-tool-section"]}>
+                  <div className={styles["chat-tool-section-title"]}>
+                    {Locale.Chat.MCP.Response}
+                  </div>
+                  <Markdown
+                    content={
+                      responseText
+                        ? formatBlock(responseText)
+                        : Locale.Chat.MCP.Running
+                    }
+                    loading={false}
+                    fontSize={14}
+                    fontFamily="inherit"
+                    defaultShow={true}
+                    status={false}
+                  />
+                </div>
+              </div>
+            ),
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+function formatMessageMeta(message: ChatMessage, isMobileScreen: boolean) {
+  const timeText = message.date || "";
+  const statistic = message.statistic;
+
+  if (!statistic) {
+    return isMobileScreen ? [timeText] : timeText;
+  }
+
+  if (message.role === "assistant") {
+    const completionTokens = statistic.completionTokens;
+    const totalReplyLatency = statistic.totalReplyLatency;
+    const firstReplyLatency = statistic.firstReplyLatency;
+
+    if (
+      typeof completionTokens !== "number" ||
+      typeof totalReplyLatency !== "number"
+    ) {
+      return isMobileScreen ? [timeText] : timeText;
+    }
+
+    const statParts = [`${completionTokens} Tokens`];
+    const isStreamingMessage =
+      typeof firstReplyLatency === "number" && firstReplyLatency > 0;
+
+    if (isStreamingMessage) {
+      const activeDuration = Math.max(
+        totalReplyLatency - firstReplyLatency,
+        10,
+      );
+      const speed = ((completionTokens * 1000) / activeDuration).toFixed(2);
+      statParts.push(
+        `⚡ ${speed} T/s`,
+        `⏱️ FT:${(firstReplyLatency / 1000).toFixed(2)}s | TT:${(
+          totalReplyLatency / 1000
+        ).toFixed(2)}s`,
+      );
+    } else {
+      const activeDuration = Math.max(totalReplyLatency, 10);
+      const speed = ((completionTokens * 1000) / activeDuration).toFixed(2);
+      statParts.push(
+        `⚡ ${speed} T/s`,
+        `⏱️ TT:${(totalReplyLatency / 1000).toFixed(2)}s`,
+      );
+    }
+
+    return isMobileScreen
+      ? [timeText, statParts.join(" ")]
+      : `${timeText} - ${statParts.join(" ")}`;
+  }
+
+  if (typeof statistic.singlePromptTokens === "number") {
+    const statText = `${statistic.singlePromptTokens} Tokens`;
+    return isMobileScreen ? [timeText, statText] : `${timeText} - ${statText}`;
+  }
+
+  return isMobileScreen ? [timeText] : timeText;
+}
+
+function getMessageDisplaySegments(message: ChatMessage): ChatMessageSegment[] {
+  if (message.segments?.length) {
+    return message.segments;
+  }
+
+  const content =
+    typeof message.content === "string"
+      ? message.content
+      : getMessageTextContent(message);
+  if (!content) return [];
+
+  return [
+    {
+      id: `${message.id}-content`,
+      type: "text",
+      content,
+      streaming: !!message.streaming,
+    },
+  ];
+}
+
+function getThoughtSegments(message: ChatMessage): ChatMessageSegment[] {
+  return getMessageDisplaySegments(message).filter(
+    (segment) => segment.type === "thought",
+  );
+}
+
+function getToolsForSegment(
+  message: ChatMessage,
+  segment: ChatMessageSegment,
+): NonNullable<ChatMessage["tools"]> {
+  if (!segment.toolIds?.length) return [];
+
+  const tools = message.tools ?? [];
+  return segment.toolIds
+    .map((toolId) => tools.find((tool) => tool.id === toolId))
+    .filter(Boolean) as NonNullable<ChatMessage["tools"]>;
+}
+
+function getMessageRevealKey(message: ChatMessage) {
+  return `${message.id}:${message.date}:${message.content.length}:${
+    message.tools?.length ?? 0
+  }:${message.segments?.length ?? 0}`;
+}
+
+function getRenderableSegments(message: ChatMessage): ChatMessageSegment[] {
+  if (!message.versions || message.versions.length < 1) {
+    return getMessageDisplaySegments(message);
+  }
+
+  const currentIndex = message.currentVersionIndex ?? 0;
+  if (currentIndex === message.versions.length) {
+    return getMessageDisplaySegments(message);
+  }
+
+  return [];
+}
+
+function AssistantMessageBody(props: {
+  message: ChatMessage & { preview?: boolean };
+  isUser: boolean;
+  isMobileScreen: boolean;
+  fontSize: number;
+  fontFamily: string;
+  scrollRef: RefObject<HTMLDivElement>;
+  defaultShow: boolean;
+  onFillInput: () => void;
+}) {
+  const {
+    message,
+    isUser,
+    isMobileScreen,
+    fontSize,
+    fontFamily,
+    scrollRef,
+    defaultShow,
+    onFillInput,
+  } = props;
+  const renderableSegments = getRenderableSegments(message);
+  const hasTools = renderableSegments.some(
+    (segment) => segment.type === "tool",
+  );
+  const hasThoughts = renderableSegments.some(
+    (segment) =>
+      segment.type === "thought" && segment.content.trim().length > 0,
+  );
+  const hasText = renderableSegments.some(
+    (segment) => segment.type === "text" && segment.content.trim().length > 0,
+  );
+  const hasRenderableContent =
+    renderableSegments.length > 0 &&
+    renderableSegments.some((segment) => {
+      if (segment.type === "tool") {
+        return getToolsForSegment(message, segment).length > 0;
+      }
+
+      return segment.content.trim().length > 0;
+    });
+  const revealKey = getMessageRevealKey(message);
+  const [revealReady, setRevealReady] = useState(() => {
+    return (
+      message.streaming ||
+      !hasTools ||
+      renderableSegments.length === 0 ||
+      hasRenderableContent
+    );
+  });
+
+  useEffect(() => {
+    const shouldDelayReveal =
+      !message.streaming &&
+      hasTools &&
+      !hasRenderableContent &&
+      (!hasThoughts || !hasText);
+
+    if (!shouldDelayReveal) {
+      setRevealReady(true);
+      return;
+    }
+
+    setRevealReady(false);
+    const timer = window.setTimeout(() => {
+      setRevealReady(true);
+    }, 120);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    message.streaming,
+    hasTools,
+    hasRenderableContent,
+    hasThoughts,
+    hasText,
+    renderableSegments.length,
+    revealKey,
+  ]);
+
+  if (!revealReady) {
+    return (
+      <div className={styles["chat-message-loading-unified"]}>
+        <LoadingIcon />
+      </div>
+    );
+  }
+
+  if (renderableSegments.length > 0) {
+    return (
+      <>
+        {renderableSegments.map((segment, segmentIndex) => {
+          if (segment.type === "tool") {
+            const toolsForSegment = getToolsForSegment(message, segment);
+            if (toolsForSegment.length === 0) return null;
+
+            return (
+              <div
+                key={`${message.id}-tool-segment-${segment.id}-${segmentIndex}`}
+                className={styles["chat-message-tools"]}
+              >
+                {toolsForSegment.map((tool, toolIndex) => (
+                  <ToolResultCard
+                    key={tool.id}
+                    tool={tool}
+                    defaultOpen={
+                      tool.isError !== false &&
+                      tool.isError !== true &&
+                      toolIndex === toolsForSegment.length - 1
+                    }
+                  />
+                ))}
+              </div>
+            );
+          }
+
+          if (segment.type === "thought") {
+            return (
+              <ThoughtSegmentBlock
+                key={`${message.id}-thought-segment-${segment.id}-${segmentIndex}`}
+                segment={segment}
+                fontSize={fontSize}
+                fontFamily={fontFamily}
+              />
+            );
+          }
+
+          return (
+            <Markdown
+              key={`${message.id}-text-segment-${segment.id}-${segmentIndex}`}
+              content={segment.content}
+              traceMessageId={message.id}
+              loading={
+                segmentIndex === 0 &&
+                (message.preview || message.streaming) &&
+                message.content.length === 0 &&
+                !isUser
+              }
+              onDoubleClickCapture={() => {
+                if (!isMobileScreen) return;
+                onFillInput();
+              }}
+              fontSize={fontSize}
+              fontFamily={fontFamily}
+              parentRef={scrollRef}
+              defaultShow={defaultShow}
+              status={message.streaming}
+            />
+          );
+        })}
+      </>
+    );
+  }
+
+  return (
+    <Markdown
+      key={message.streaming ? "loading" : "done"}
+      content={getMessageDisplayContent(message)}
+      traceMessageId={message.id}
+      loading={
+        (message.preview || message.streaming) &&
+        message.content.length === 0 &&
+        !isUser
+      }
+      onDoubleClickCapture={() => {
+        if (!isMobileScreen) return;
+        onFillInput();
+      }}
+      fontSize={fontSize}
+      fontFamily={fontFamily}
+      parentRef={scrollRef}
+      defaultShow={defaultShow}
+      status={message.streaming}
+    />
+  );
+}
+
+function getMessageDisplayContent(message: ChatMessage): string {
+  const segments = getMessageDisplaySegments(message);
+  const textContent = getTextContentFromSegments(segments);
+
+  if (textContent) {
+    return textContent;
+  }
+
+  if (segments.length > 0) {
+    return "";
+  }
+
+  return typeof message.content === "string"
+    ? message.content
+    : getMessageTextContent(message);
 }
 
 function ThinkingPanel(props: { showPanel: boolean; onClose: () => void }) {
@@ -468,6 +1004,7 @@ function ShortcutKeyPanel(props: { showPanel: boolean; onClose: () => void }) {
 function MCPPanel(props: { showPanel: boolean; onClose: () => void }) {
   const { showPanel, onClose } = props;
   const chatStore = useChatStore();
+  const config = useAppConfig();
   const [mcpClients, setMcpClients] = useState<MCPClient[]>([]);
   const [loading, setLoading] = useState(true);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -529,7 +1066,7 @@ function MCPPanel(props: { showPanel: boolean; onClose: () => void }) {
 
   if (!showPanel) return null;
 
-  const mcpEnabled = chatStore.getSessionMcpEnabled();
+  const mcpEnabled = config.mcpEnabled;
 
   return (
     <div ref={panelRef} className={styles["mcp-panel"]}>
@@ -579,9 +1116,8 @@ function MCPPanel(props: { showPanel: boolean; onClose: () => void }) {
             ) : (
               <div className={styles["mcp-client-list"]}>
                 {mcpClients.map((client) => {
-                  const isEnabled = chatStore.getSessionMcpClientStatus(
-                    client.clientId,
-                  );
+                  const isEnabled =
+                    config.mcpEnabledClients?.[client.clientId] ?? true;
                   const toolCount = client.tools?.tools?.length || 0;
 
                   return (
@@ -591,7 +1127,7 @@ function MCPPanel(props: { showPanel: boolean; onClose: () => void }) {
                     >
                       <div className={styles["mcp-client-info"]}>
                         <div className={styles["mcp-client-name"]}>
-                          {client.clientId}
+                          {getMcpDisplayName(client.clientId)}
                         </div>
                         <div className={styles["mcp-client-tools"]}>
                           {Locale.Chat.MCP.ToolsCount(toolCount)}
@@ -945,13 +1481,16 @@ export function ChatAction(props: {
   icon: JSX.Element;
   onClick: () => void;
   dataAttribute?: string;
+  active?: boolean;
 }) {
   const [showTooltip, setShowTooltip] = useState(false);
 
   return (
     <div className={styles["chat-action-wrapper"]}>
       <button
-        className={clsx(styles["chat-input-action"], "clickable")}
+        className={clsx(styles["chat-input-action"], "clickable", {
+          [styles["chat-input-action-active"]]: props.active,
+        })}
         onClick={props.onClick}
         type="button"
         onMouseEnter={() => setShowTooltip(true)}
@@ -959,6 +1498,7 @@ export function ChatAction(props: {
         {...(props.dataAttribute && { [props.dataAttribute]: true })}
       >
         <div className={styles["icon"]}>{props.icon}</div>
+        {props.active && <span className={styles["chat-action-indicator"]} />}
       </button>
       {showTooltip && (
         <div className={styles["chat-action-tooltip"]}>{props.text}</div>
@@ -991,7 +1531,10 @@ export function TokenCounter(props: {
   const modelConfig = props.session.mask.modelConfig;
   const usedTokens = calculateUsedTokens();
   const contextConfig = getModelContextTokens(props.currentModel);
-  const maxTokens = contextConfig?.contextTokens;
+  const maxTokens =
+    modelConfig.compressMessageLengthThreshold > 0
+      ? modelConfig.compressMessageLengthThreshold
+      : contextConfig?.contextTokens;
 
   // 计算当前上下文数量
   const currentContextCount = props.session.messages.length;
@@ -1118,8 +1661,8 @@ function useScrollToBottom(
 }
 
 export function ChatActions(props: {
-  uploadImage: () => void;
-  setAttachImages: (images: string[]) => void;
+  uploadAttachment: () => void;
+  setAttachments: (attachments: ChatAttachment[]) => void;
   setUploading: (uploading: boolean) => void;
   scrollToBottom: () => void;
   showPromptHints: () => void;
@@ -1158,10 +1701,6 @@ export function ChatActions(props: {
     const nextTheme = themes[nextIndex];
     config.update((config) => (config.theme = nextTheme));
   }
-
-  // stop all responses
-  const couldStop = ChatControllerPool.hasPending();
-  const stopAll = () => ChatControllerPool.stopAll();
 
   // switch model
   const currentModel = session.mask.modelConfig.model;
@@ -1256,7 +1795,7 @@ export function ChatActions(props: {
     return result;
   }, [models, accessStore.customProviders]);
 
-  const [showUploadImage, setShowUploadImage] = useState(false);
+  const canUploadAttachment = true;
 
   const [showSizeSelector, setShowSizeSelector] = useState(false);
   const [showQualitySelector, setShowQualitySelector] = useState(false);
@@ -1271,15 +1810,12 @@ export function ChatActions(props: {
 
   const isMobileScreen = useMobileScreen();
 
-  const { setAttachImages, setUploading } = props;
+  const { setAttachments, setUploading } = props;
   useEffect(() => {
-    const show = isVisionModel(currentModel);
-    setShowUploadImage(show);
-    if (!show) {
-      setAttachImages([]);
+    if (!isVisionModel(currentModel)) {
       setUploading(false);
     }
-  }, [currentModel, setAttachImages, setUploading]);
+  }, [currentModel, setUploading]);
 
   // 分离模型可用性检查到单独的 useEffect
   // 使用 ref 来避免依赖 session 对象
@@ -1328,13 +1864,6 @@ export function ChatActions(props: {
 
   const leftActions = (
     <>
-      {couldStop && (
-        <ChatAction
-          onClick={stopAll}
-          text={Locale.Chat.InputActions.Stop}
-          icon={<StopIcon />}
-        />
-      )}
       {!props.hitBottom && (
         <ChatAction
           onClick={props.scrollToBottom}
@@ -1343,10 +1872,10 @@ export function ChatActions(props: {
         />
       )}
 
-      {showUploadImage && (
+      {canUploadAttachment && (
         <ChatAction
-          onClick={props.uploadImage}
-          text={Locale.Chat.InputActions.UploadImage}
+          onClick={props.uploadAttachment}
+          text={Locale.Chat.InputActions.UploadAttachment}
           icon={props.uploading ? <LoadingButtonIcon /> : <ImageIcon />}
         />
       )}
@@ -1535,7 +2064,9 @@ export function ChatActions(props: {
           onTogglePanel={() => props.setShowMcpPanel(!props.showMcpPanel)}
         />
       )}
-      <MultiModelAction onToggle={() => props.toggleMultiModelMode()} />
+      {config.enableMultiModel && (
+        <MultiModelAction onToggle={() => props.toggleMultiModelMode()} />
+      )}
     </>
   );
   const rightActions = (
@@ -1588,123 +2119,131 @@ export function ChatActions(props: {
           )}
         </button>
 
-        {props.showModelSelector && !session.multiModelMode?.enabled && (
-          <ModelSelectorModal
-            defaultSelectedValue={`${currentModel}@${currentProviderName}`}
-            groups={modelGroups}
-            searchPlaceholder={Locale.Chat.UI.SearchModels}
-            onClose={() => props.setShowModelSelector(false)}
-            onSelection={(selectedValue) => {
-              const [model, providerId] = getModelProvider(selectedValue);
-              chatStore.updateTargetSession(session, (session) => {
-                session.mask.modelConfig.model = model as ModelType;
-                // 直接保存 providerId（支持 custom_ 前缀），避免被标准化为内置服务商
-                session.mask.modelConfig.providerName = providerId! as any;
-                session.mask.syncGlobalConfig = false;
+        {props.showModelSelector &&
+          (!config.enableMultiModel || !session.multiModelMode?.enabled) && (
+            <ModelSelectorModal
+              defaultSelectedValue={`${currentModel}@${currentProviderName}`}
+              groups={modelGroups}
+              searchPlaceholder={Locale.Chat.UI.SearchModels}
+              onClose={() => props.setShowModelSelector(false)}
+              onSelection={(selectedValue) => {
+                const [model, providerId] = getModelProvider(selectedValue);
+                chatStore.updateTargetSession(session, (session) => {
+                  session.mask.modelConfig.model = model as ModelType;
+                  // 直接保存 providerId（支持 custom_ 前缀），避免被标准化为内置服务商
+                  session.mask.modelConfig.providerName = providerId! as any;
+                  session.mask.syncGlobalConfig = false;
 
-                // 检查新模型是否支持thinking功能，如果支持且thinkingBudget未设置，则设置默认值
-                const modelCapabilities = getModelCapabilitiesWithCustomConfig(
-                  session.mask.modelConfig.model,
-                );
-                if (
-                  modelCapabilities.reasoning &&
-                  modelCapabilities.thinkingType &&
-                  session.mask.modelConfig.thinkingBudget === undefined
-                ) {
-                  session.mask.modelConfig.thinkingBudget = -1; // 默认为动态思考
-                }
-
-                // 根据新模型自动更新压缩阈值
-                const autoThreshold = getModelCompressThreshold(model);
-                session.mask.modelConfig.compressMessageLengthThreshold =
-                  autoThreshold;
-              });
-
-              const selectedModel = models.find(
-                (m) => m.name == model && m?.provider?.id == providerId,
-              );
-
-              if (providerId == "ByteDance") {
-                showToast(selectedModel?.displayName ?? "");
-              } else {
-                showToast(selectedModel?.displayName || model);
-              }
-            }}
-          />
-        )}
-
-        {props.showModelSelector && session.multiModelMode?.enabled && (
-          <MultiModelSelectorModal
-            groups={modelGroups}
-            defaultSelectedValues={session.multiModelMode?.selectedModels || []}
-            searchPlaceholder={Locale.Chat.UI.SearchModels}
-            onClose={() => props.setShowModelSelector(false)}
-            onSelection={(selectedValues) => {
-              // 确保至少选择了两个模型
-              if (selectedValues.length < 2) {
-                showToast(Locale.Chat.MultiModel.MinimumModelsError);
-                return;
-              }
-
-              chatStore.updateTargetSession(session, (session) => {
-                if (!session.multiModelMode) {
-                  session.multiModelMode = {
-                    enabled: true,
-                    selectedModels: [],
-                    modelMessages: {},
-                    modelStats: {},
-                    modelMemoryPrompts: {},
-                    modelSummarizeIndexes: {},
-                  };
-                }
-
-                session.multiModelMode.selectedModels = selectedValues;
-                session.multiModelMode.enabled = true; // 确保启用多模型模式
-
-                // 初始化新选中模型的数据结构
-                selectedValues.forEach((modelKey) => {
-                  if (!session.multiModelMode!.modelMessages[modelKey]) {
-                    session.multiModelMode!.modelMessages[modelKey] = [];
+                  // 检查新模型是否支持thinking功能，如果支持且thinkingBudget未设置，则设置默认值
+                  const modelCapabilities =
+                    getModelCapabilitiesWithCustomConfig(
+                      session.mask.modelConfig.model,
+                    );
+                  if (
+                    modelCapabilities.reasoning &&
+                    modelCapabilities.thinkingType &&
+                    session.mask.modelConfig.thinkingBudget === undefined
+                  ) {
+                    session.mask.modelConfig.thinkingBudget = -1; // 默认为动态思考
                   }
-                  if (!session.multiModelMode!.modelStats[modelKey]) {
-                    session.multiModelMode!.modelStats[modelKey] = {
-                      tokenCount: 0,
-                      wordCount: 0,
-                      charCount: 0,
+
+                  // 根据新模型自动更新压缩阈值
+                  const autoThreshold = getModelCompressThreshold(model);
+                  session.mask.modelConfig.compressMessageLengthThreshold =
+                    autoThreshold;
+                });
+
+                const selectedModel = models.find(
+                  (m) => m.name == model && m?.provider?.id == providerId,
+                );
+
+                if (providerId == "ByteDance") {
+                  showToast(selectedModel?.displayName ?? "");
+                } else {
+                  showToast(selectedModel?.displayName || model);
+                }
+              }}
+            />
+          )}
+
+        {props.showModelSelector &&
+          config.enableMultiModel &&
+          session.multiModelMode?.enabled && (
+            <MultiModelSelectorModal
+              groups={modelGroups}
+              defaultSelectedValues={
+                session.multiModelMode?.selectedModels || []
+              }
+              searchPlaceholder={Locale.Chat.UI.SearchModels}
+              onClose={() => props.setShowModelSelector(false)}
+              onSelection={(selectedValues) => {
+                // 确保至少选择了两个模型
+                if (selectedValues.length < 2) {
+                  showToast(Locale.Chat.MultiModel.MinimumModelsError);
+                  return;
+                }
+
+                chatStore.updateTargetSession(session, (session) => {
+                  if (!session.multiModelMode) {
+                    session.multiModelMode = {
+                      enabled: true,
+                      selectedModels: [],
+                      modelMessages: {},
+                      modelStats: {},
+                      modelMemoryPrompts: {},
+                      modelSummarizeIndexes: {},
                     };
                   }
-                  if (!session.multiModelMode!.modelMemoryPrompts[modelKey]) {
-                    session.multiModelMode!.modelMemoryPrompts[modelKey] = "";
-                  }
-                  if (
-                    !session.multiModelMode!.modelSummarizeIndexes[modelKey]
-                  ) {
-                    session.multiModelMode!.modelSummarizeIndexes[modelKey] = 0;
-                  }
+
+                  session.multiModelMode.selectedModels = selectedValues;
+                  session.multiModelMode.enabled = true; // 确保启用多模型模式
+
+                  // 初始化新选中模型的数据结构
+                  selectedValues.forEach((modelKey) => {
+                    if (!session.multiModelMode!.modelMessages[modelKey]) {
+                      session.multiModelMode!.modelMessages[modelKey] = [];
+                    }
+                    if (!session.multiModelMode!.modelStats[modelKey]) {
+                      session.multiModelMode!.modelStats[modelKey] = {
+                        tokenCount: 0,
+                        wordCount: 0,
+                        charCount: 0,
+                      };
+                    }
+                    if (!session.multiModelMode!.modelMemoryPrompts[modelKey]) {
+                      session.multiModelMode!.modelMemoryPrompts[modelKey] = "";
+                    }
+                    if (
+                      !session.multiModelMode!.modelSummarizeIndexes[modelKey]
+                    ) {
+                      session.multiModelMode!.modelSummarizeIndexes[
+                        modelKey
+                      ] = 0;
+                    }
+                  });
+
+                  // 清理不再选中的模型数据
+                  const currentKeys = Object.keys(
+                    session.multiModelMode.modelMessages,
+                  );
+                  currentKeys.forEach((key) => {
+                    if (!selectedValues.includes(key)) {
+                      delete session.multiModelMode!.modelMessages[key];
+                      delete session.multiModelMode!.modelStats[key];
+                      delete session.multiModelMode!.modelMemoryPrompts[key];
+                      delete session.multiModelMode!.modelSummarizeIndexes[key];
+                    }
+                  });
                 });
 
-                // 清理不再选中的模型数据
-                const currentKeys = Object.keys(
-                  session.multiModelMode.modelMessages,
+                showToast(
+                  Locale.Chat.MultiModel.ModelsSelectedToast(
+                    selectedValues.length,
+                  ),
                 );
-                currentKeys.forEach((key) => {
-                  if (!selectedValues.includes(key)) {
-                    delete session.multiModelMode!.modelMessages[key];
-                    delete session.multiModelMode!.modelStats[key];
-                    delete session.multiModelMode!.modelMemoryPrompts[key];
-                    delete session.multiModelMode!.modelSummarizeIndexes[key];
-                  }
-                });
-              });
-
-              showToast(
-                Locale.Chat.MultiModel.ModelsSelectedToast(
-                  selectedValues.length,
-                ),
-              );
-            }}
-          />
-        )}
+              }}
+            />
+          )}
       </div>
     </>
   );
@@ -1919,7 +2458,7 @@ function ChatInner() {
   const isMobileScreen = useMobileScreen();
   const navigate = useNavigate();
   const { isCollapsed, toggleSideBarCollapse } = useDragSideBar();
-  const [attachImages, setAttachImages] = useState<string[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
 
   // prompt hints
@@ -1991,7 +2530,7 @@ function ChatInner() {
   };
 
   const doSubmit = (userInput: string) => {
-    if (userInput.trim() === "" && isEmpty(attachImages)) return;
+    if (userInput.trim() === "" && isEmpty(attachments)) return;
     const matchCommand = chatCommands.match(userInput);
     if (matchCommand.matched) {
       setUserInput("");
@@ -2001,9 +2540,9 @@ function ChatInner() {
     }
     setIsLoading(true);
     chatStore
-      .onUserInput(userInput, attachImages)
+      .onUserInput(userInput, attachments)
       .then(() => setIsLoading(false));
-    setAttachImages([]);
+    setAttachments([]);
     chatStore.setLastInput(userInput);
     setUserInput("");
     setPromptHints([]);
@@ -2160,8 +2699,10 @@ function ChatInner() {
     deleteMessage(userMessage.id);
     setIsLoading(true);
     const textContent = getMessageTextContent(userMessage);
-    const images = getMessageImages(userMessage);
-    chatStore.onUserInput(textContent, images).then(() => setIsLoading(false));
+    const messageAttachments = getMessageAttachments(userMessage);
+    chatStore
+      .onUserInput(textContent, messageAttachments)
+      .then(() => setIsLoading(false));
     inputRef.current?.focus();
   };
 
@@ -2206,25 +2747,40 @@ function ChatInner() {
   const getCurrentMessageContent = (message: ChatMessage): string => {
     // 若消息没有版本，优先返回字符串；否则从多模态数组里提取文本
     if (!message.versions || message.versions.length < 1) {
-      return typeof message.content === "string"
-        ? message.content
-        : getMessageTextContent(message);
+      return getMessageDisplayContent(message);
     }
 
     const currentIndex = message.currentVersionIndex ?? 0;
     if (currentIndex === message.versions.length) {
       // 显示最新版本（当前消息内容）
-      return typeof message.content === "string"
-        ? message.content
-        : getMessageTextContent(message);
+      return getMessageDisplayContent(message);
     } else if (currentIndex >= 0 && currentIndex < message.versions.length) {
       // 显示历史版本（字符串）
       return message.versions[currentIndex];
     }
 
-    return typeof message.content === "string"
-      ? message.content
-      : getMessageTextContent(message);
+    return getMessageDisplayContent(message);
+  };
+
+  const renderMessageMeta = (message: ChatMessage, isContext: boolean) => {
+    const meta = isContext
+      ? (Locale.Chat.IsContext as string)
+      : formatMessageMeta(message, isMobileScreen);
+
+    if (Array.isArray(meta)) {
+      return (
+        <>
+          {meta.map((line, index) => (
+            <React.Fragment key={`${message.id}-meta-${index}`}>
+              {index > 0 && <br />}
+              {line}
+            </React.Fragment>
+          ))}
+        </>
+      );
+    }
+
+    return meta;
   };
 
   const onPinMessage = (message: ChatMessage) => {
@@ -2317,20 +2873,32 @@ function ChatInner() {
 
   // preview messages
   const renderMessages = useMemo(() => {
+    const previewContent =
+      attachments.length > 0
+        ? buildUserMessageContent(userInput, attachments)
+        : userInput;
+
     return context.concat(session.messages as RenderMessage[]).concat(
-      userInput.length > 0 && config.sendPreviewBubble
+      (userInput.length > 0 || attachments.length > 0) &&
+        config.sendPreviewBubble
         ? [
             {
               ...createMessage({
                 role: "user",
-                content: userInput,
+                content: previewContent,
               }),
               preview: true,
             },
           ]
         : [],
     );
-  }, [config.sendPreviewBubble, context, session.messages, userInput]);
+  }, [
+    attachments,
+    config.sendPreviewBubble,
+    context,
+    session.messages,
+    userInput,
+  ]);
 
   const [msgRenderIndex, _setMsgRenderIndex] = useState(
     Math.max(0, renderMessages.length - CHAT_PAGE_SIZE),
@@ -2460,90 +3028,47 @@ function ChatInner() {
 
   const handlePaste = useCallback(
     async (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const currentModel = chatStore.currentSession().mask.modelConfig.model;
-      if (!isVisionModel(currentModel)) {
-        return;
-      }
       const items = (event.clipboardData || window.clipboardData).items;
       for (const item of items) {
         if (item.kind === "file" && item.type.startsWith("image/")) {
           event.preventDefault();
           const file = item.getAsFile();
           if (file) {
-            const images: string[] = [];
-            images.push(...attachImages);
-            images.push(
-              ...(await new Promise<string[]>((res, rej) => {
-                setUploading(true);
-                const imagesData: string[] = [];
-                uploadImageRemote(file)
-                  .then((dataUrl) => {
-                    imagesData.push(dataUrl);
-                    setUploading(false);
-                    res(imagesData);
-                  })
-                  .catch((e) => {
-                    setUploading(false);
-                    rej(e);
-                  });
-              })),
-            );
-            const imagesLength = images.length;
-
-            if (imagesLength > 3) {
-              images.splice(3, imagesLength - 3);
+            setUploading(true);
+            try {
+              const nextAttachment = await buildAttachmentFromFile(file);
+              setAttachments((prev) => [...prev, nextAttachment]);
+            } finally {
+              setUploading(false);
             }
-            setAttachImages(images);
           }
         }
       }
     },
-    [attachImages, chatStore],
+    [],
   );
 
-  async function uploadImage() {
-    const images: string[] = [];
-    images.push(...attachImages);
+  async function uploadAttachment() {
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept =
+      "image/png,image/jpeg,image/webp,image/heic,image/heif,text/plain,text/markdown,.md,.txt,.json,.csv,.log,.yaml,.yml,.xml";
+    fileInput.multiple = true;
+    fileInput.onchange = async (event: any) => {
+      const files = Array.from(event.target.files || []) as File[];
+      if (files.length === 0) return;
 
-    images.push(
-      ...(await new Promise<string[]>((res, rej) => {
-        const fileInput = document.createElement("input");
-        fileInput.type = "file";
-        fileInput.accept =
-          "image/png, image/jpeg, image/webp, image/heic, image/heif";
-        fileInput.multiple = true;
-        fileInput.onchange = (event: any) => {
-          setUploading(true);
-          const files = event.target.files;
-          const imagesData: string[] = [];
-          for (let i = 0; i < files.length; i++) {
-            const file = event.target.files[i];
-            uploadImageRemote(file)
-              .then((dataUrl) => {
-                imagesData.push(dataUrl);
-                if (
-                  imagesData.length === 3 ||
-                  imagesData.length === files.length
-                ) {
-                  setUploading(false);
-                  res(imagesData);
-                }
-              })
-              .catch((e) => {
-                setUploading(false);
-                rej(e);
-              });
-          }
-        };
-        fileInput.click();
-      })),
-    );
-
-    const imagesLength = images.length;
-    if (imagesLength > 3) {
-      images.splice(3, imagesLength - 3);
-    }
-    setAttachImages(images);
+      setUploading(true);
+      try {
+        const nextAttachments = await Promise.all(
+          files.map((file) => buildAttachmentFromFile(file)),
+        );
+        setAttachments((prev) => [...prev, ...nextAttachments]);
+      } finally {
+        setUploading(false);
+      }
+    };
+    fileInput.click();
   }
 
   // 快捷键 shortcut keys
@@ -2562,6 +3087,10 @@ function ChatInner() {
 
   // 切换多模型模式
   const toggleMultiModelMode = () => {
+    if (!config.enableMultiModel) {
+      return;
+    }
+
     chatStore.updateTargetSession(session, (session) => {
       if (!session.multiModelMode) {
         session.multiModelMode = {
@@ -2594,6 +3123,25 @@ function ChatInner() {
       showToast(Locale.Chat.MultiModel.DisableToast);
     }
   };
+
+  useEffect(() => {
+    if (!config.enableMultiModel) {
+      chatStore.updateTargetSession(session, (session) => {
+        if (!session.multiModelMode) {
+          return;
+        }
+        session.multiModelMode.enabled = false;
+        session.multiModelMode.selectedModels = [];
+        session.multiModelMode.modelMessages = {};
+        session.multiModelMode.modelStats = {};
+        session.multiModelMode.modelMemoryPrompts = {};
+        session.multiModelMode.modelSummarizeIndexes = {};
+      });
+      setShowMultiModelPanel(false);
+      setShowModelSelector(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.enableMultiModel]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2832,19 +3380,13 @@ function ChatInner() {
                                     let newContent:
                                       | string
                                       | MultimodalContent[] = newMessage;
-                                    const images = getMessageImages(message);
-                                    if (images.length > 0) {
-                                      newContent = [
-                                        { type: "text", text: newMessage },
-                                      ];
-                                      for (let i = 0; i < images.length; i++) {
-                                        newContent.push({
-                                          type: "image_url",
-                                          image_url: {
-                                            url: images[i],
-                                          },
-                                        });
-                                      }
+                                    const messageAttachments =
+                                      getMessageAttachments(message);
+                                    if (messageAttachments.length > 0) {
+                                      newContent = buildUserMessageContent(
+                                        newMessage,
+                                        messageAttachments,
+                                      );
                                     }
                                     chatStore.updateTargetSession(
                                       session,
@@ -2867,8 +3409,7 @@ function ChatInner() {
                                   {["system"].includes(message.role) ? (
                                     <Avatar avatar="2699-fe0f" />
                                   ) : (
-                                    <MaskAvatar
-                                      avatar={session.mask.avatar}
+                                    <Avatar
                                       model={
                                         message.model ||
                                         session.mask.modelConfig.model
@@ -2894,7 +3435,6 @@ function ChatInner() {
                                 )}
                               </div>
                             )}
-
                             {showActions && (
                               <div className={styles["chat-message-actions"]}>
                                 <div className={styles["chat-input-actions"]}>
@@ -3009,129 +3549,87 @@ function ChatInner() {
                               </div>
                             )}
                           </div>
-                          {message?.tools?.length == 0 && showTyping && (
+                          {(message.tools?.length ?? 0) === 0 && showTyping && (
                             <div className={styles["chat-message-status"]}>
                               {Locale.Chat.Typing}
                             </div>
                           )}
-                          {/*@ts-ignore*/}
-                          {message?.tools?.length > 0 && (
-                            <div className={styles["chat-message-tools"]}>
-                              {message?.tools?.map((tool) => (
-                                <div
-                                  key={tool.id}
-                                  title={tool?.errorMsg}
-                                  className={styles["chat-message-tool"]}
-                                >
-                                  {tool.isError === false ? (
-                                    <ConfirmIcon />
-                                  ) : tool.isError === true ? (
-                                    <CloseIcon />
-                                  ) : (
-                                    <LoadingButtonIcon />
-                                  )}
-                                  <span>{tool?.function?.name}</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
                           <div className={styles["chat-message-item"]}>
-                            <Markdown
-                              key={message.streaming ? "loading" : "done"}
-                              content={(() => {
-                                // 获取当前显示的消息内容
-                                const messageContent =
-                                  getCurrentMessageContent(message);
-                                const isThinking = isThinkingModel(
-                                  message.model,
-                                );
-                                const shouldWrap =
-                                  !message.streaming && isThinking;
-
-                                if (shouldWrap) {
-                                  const wrappedContent =
-                                    wrapThinkingPart(messageContent);
-                                  return wrappedContent;
+                            <div className={styles["chat-message-body"]}>
+                              <AssistantMessageBody
+                                message={message}
+                                isUser={isUser}
+                                isMobileScreen={isMobileScreen}
+                                fontSize={fontSize}
+                                fontFamily={fontFamily}
+                                scrollRef={scrollRef}
+                                defaultShow={i >= messages.length - 6}
+                                onFillInput={() =>
+                                  setUserInput(getMessageTextContent(message))
                                 }
-
-                                return messageContent;
-                              })()}
-                              loading={
-                                (message.preview || message.streaming) &&
-                                message.content.length === 0 &&
-                                !isUser
-                              }
-                              //   onContextMenu={(e) => onRightClick(e, message)} // hard to use
-                              onDoubleClickCapture={() => {
-                                if (!isMobileScreen) return;
-                                setUserInput(getMessageTextContent(message));
-                              }}
-                              fontSize={fontSize}
-                              fontFamily={fontFamily}
-                              parentRef={scrollRef}
-                              defaultShow={i >= messages.length - 6}
-                              thinkingTime={message.statistic?.reasoningLatency}
-                              status={message.streaming}
-                            />
-                            {getMessageImages(message).length == 1 && (
-                              <div
-                                className={
-                                  styles["chat-message-item-image-container"]
-                                }
-                                style={{ aspectRatio: ratio }}
-                              >
-                                <Image
-                                  className={styles["chat-message-item-image"]}
-                                  src={getMessageImages(message)[0]}
-                                  alt=""
-                                  fill
-                                  unoptimized
-                                  onLoadingComplete={(img) => {
-                                    setRatio(
-                                      img.naturalWidth / img.naturalHeight,
-                                    );
-                                  }}
-                                />
-                              </div>
-                            )}
-                            {getMessageImages(message).length > 1 && (
-                              <div
-                                className={styles["chat-message-item-images"]}
-                                style={
-                                  {
-                                    "--image-count":
-                                      getMessageImages(message).length,
-                                  } as React.CSSProperties
-                                }
-                              >
-                                {getMessageImages(message).map(
-                                  (image, index) => {
-                                    return (
-                                      <div
-                                        className={
-                                          styles[
-                                            "chat-message-item-image-multi-container"
-                                          ]
-                                        }
-                                        key={index}
-                                      >
-                                        <Image
+                              />
+                              {getMessageImages(message).length == 1 && (
+                                <div
+                                  className={
+                                    styles["chat-message-item-image-container"]
+                                  }
+                                  style={{ aspectRatio: ratio }}
+                                >
+                                  <Image
+                                    className={
+                                      styles["chat-message-item-image"]
+                                    }
+                                    src={getMessageImages(message)[0]}
+                                    alt=""
+                                    fill
+                                    unoptimized
+                                    onLoadingComplete={(img) => {
+                                      setRatio(
+                                        img.naturalWidth / img.naturalHeight,
+                                      );
+                                    }}
+                                  />
+                                </div>
+                              )}
+                              {getMessageImages(message).length > 1 && (
+                                <div
+                                  className={styles["chat-message-item-images"]}
+                                  style={
+                                    {
+                                      "--image-count":
+                                        getMessageImages(message).length,
+                                    } as React.CSSProperties
+                                  }
+                                >
+                                  {getMessageImages(message).map(
+                                    (image, index) => {
+                                      return (
+                                        <div
                                           className={
                                             styles[
-                                              "chat-message-item-image-multi"
+                                              "chat-message-item-image-multi-container"
                                             ]
                                           }
-                                          src={image}
-                                          alt=""
-                                          fill
-                                          unoptimized
-                                        />
-                                      </div>
-                                    );
-                                  },
-                                )}
-                              </div>
-                            )}
+                                          key={index}
+                                        >
+                                          <Image
+                                            className={
+                                              styles[
+                                                "chat-message-item-image-multi"
+                                              ]
+                                            }
+                                            src={image}
+                                            alt=""
+                                            fill
+                                            unoptimized
+                                          />
+                                        </div>
+                                      );
+                                    },
+                                  )}
+                                </div>
+                              )}
+                            </div>
                           </div>
                           {message?.audio_url && (
                             <div className={styles["chat-message-audio"]}>
@@ -3151,9 +3649,7 @@ function ChatInner() {
                                   {(message.versions?.length ?? 0) + 1}
                                 </span>
                               )}
-                            {isContext
-                              ? Locale.Chat.IsContext
-                              : message.date.toLocaleString()}
+                            {renderMessageMeta(message, isContext)}
                           </div>
                         </div>
                       </div>
@@ -3184,7 +3680,7 @@ function ChatInner() {
               />
 
               <MultiModelPanel
-                showPanel={showMultiModelPanel}
+                showPanel={config.enableMultiModel && showMultiModelPanel}
                 onClose={() => setShowMultiModelPanel(false)}
                 onOpenSelector={() => {
                   setShowMultiModelPanel(false);
@@ -3193,8 +3689,8 @@ function ChatInner() {
               />
 
               <ChatActions
-                uploadImage={uploadImage}
-                setAttachImages={setAttachImages}
+                uploadAttachment={uploadAttachment}
+                setAttachments={setAttachments}
                 setUploading={setUploading}
                 scrollToBottom={scrollToBottom}
                 hitBottom={hitBottom}
@@ -3229,7 +3725,7 @@ function ChatInner() {
               <label
                 className={clsx(styles["chat-input-panel-inner"], {
                   [styles["chat-input-panel-inner-attach"]]:
-                    attachImages.length !== 0,
+                    attachments.length !== 0,
                 })}
                 htmlFor="chat-input"
               >
@@ -3251,20 +3747,41 @@ function ChatInner() {
                     fontFamily: config.fontFamily,
                   }}
                 />
-                {attachImages.length != 0 && (
+                {attachments.length !== 0 && (
                   <div className={styles["attach-images"]}>
-                    {attachImages.map((image, index) => {
+                    {attachments.map((attachment, index) => {
+                      const isImage = attachment.type === "image";
+
                       return (
                         <div
-                          key={index}
-                          className={styles["attach-image"]}
-                          style={{ backgroundImage: `url("${image}")` }}
+                          key={attachment.id}
+                          className={clsx(styles["attach-item"], {
+                            [styles["attach-image"]]: isImage,
+                            [styles["attach-file"]]: !isImage,
+                          })}
+                          style={
+                            isImage && attachment.previewUrl
+                              ? {
+                                  backgroundImage: `url("${attachment.previewUrl}")`,
+                                }
+                              : undefined
+                          }
                         >
+                          {!isImage && (
+                            <div className={styles["attach-file-content"]}>
+                              <div className={styles["attach-file-name"]}>
+                                {attachment.name}
+                              </div>
+                              <div className={styles["attach-file-type"]}>
+                                {attachment.mimeType}
+                              </div>
+                            </div>
+                          )}
                           <div className={styles["attach-image-mask"]}>
                             <DeleteImageButton
                               deleteImage={() => {
-                                setAttachImages(
-                                  attachImages.filter((_, i) => i !== index),
+                                setAttachments(
+                                  attachments.filter((_, i) => i !== index),
                                 );
                               }}
                             />

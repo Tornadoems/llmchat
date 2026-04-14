@@ -8,7 +8,25 @@ const nextConfig = {
   webpack(config) {
     config.module.rules.push({
       test: /\.svg$/,
-      use: ["@svgr/webpack"],
+      use: [
+        {
+          loader: "@svgr/webpack",
+          options: {
+            svgoConfig: {
+              plugins: [
+                {
+                  name: "preset-default",
+                  params: {
+                    overrides: {
+                      removeViewBox: false,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      ],
     });
 
     if (disableChunk) {
@@ -74,7 +92,7 @@ if (mode !== "export") {
       //   source: "/api/proxy/v1/:path*",
       //   destination: "https://api.openai.com/v1/:path*",
       // },
-      
+
       {
         source: "/api/proxy/google/:path*",
         destination: "https://generativelanguage.googleapis.com/:path*",

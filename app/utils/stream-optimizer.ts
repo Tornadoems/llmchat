@@ -1,4 +1,18 @@
 import { ChatSession, ChatMessage } from "../store/chat";
+import { getLatestMessageTrace, recordStreamTraceStage } from "./stream-trace";
+
+type StreamingMessageChanges = Partial<ChatMessage> & {
+  _trace?: {
+    traceId: string;
+    seq: number;
+    model?: string;
+    source?: string;
+    sessionId?: string;
+    contentLength: number;
+    chunkLength: number;
+    remainLength: number;
+  };
+};
 
 // 流式更新优化工具
 export class StreamUpdateOptimizer {
@@ -7,13 +21,13 @@ export class StreamUpdateOptimizer {
     {
       session: ChatSession;
       messageId: string;
-      content: string;
+      changes: StreamingMessageChanges;
       lastUpdate: number;
     }
   >();
 
   private updateTimer: NodeJS.Timeout | null = null;
-  private readonly BATCH_DELAY = 100; // 100ms 批量更新延迟
+  private readonly BATCH_DELAY = 33; // 更接近逐帧的批量窗口，提升流式显示连贯性
 
   constructor(private onBatchUpdate: (updates: Map<string, any>) => void) {}
 
@@ -21,32 +35,65 @@ export class StreamUpdateOptimizer {
   updateStreamingMessage(
     sessionId: string,
     messageId: string,
-    content: string,
+    changes: StreamingMessageChanges,
     session: ChatSession,
   ) {
-    const key = `${sessionId}-${messageId}`;
+    const traceMeta = getLatestMessageTrace(messageId);
+    if (traceMeta) {
+      recordStreamTraceStage("optimizer_enqueue", {
+        traceId: traceMeta.traceId,
+        sessionId: traceMeta.sessionId,
+        messageId,
+        seq: traceMeta.seq,
+        model: traceMeta.model,
+        source: traceMeta.source,
+        contentLength: traceMeta.contentLength,
+        chunkLength: traceMeta.chunkLength,
+        remainLength: traceMeta.remainLength,
+      });
+    }
 
-    // 缓存更新
+    const key = `${sessionId}-${messageId}`;
+    const previous = this.pendingUpdates.get(key);
+
+    // 合并同一消息在一个批次窗口内的多次更新，避免后到的工具事件覆盖掉更早的 streaming/content 状态
     this.pendingUpdates.set(key, {
       session,
       messageId,
-      content,
+      changes: {
+        ...(previous?.changes ?? {}),
+        ...changes,
+      },
       lastUpdate: Date.now(),
     });
 
-    // 防抖批量更新
-    if (this.updateTimer) {
-      clearTimeout(this.updateTimer);
+    // 使用固定窗口批量刷新，避免高频 token 持续到达时界面一直不更新
+    if (!this.updateTimer) {
+      this.updateTimer = setTimeout(() => {
+        this.flushUpdates();
+      }, this.BATCH_DELAY);
     }
-
-    this.updateTimer = setTimeout(() => {
-      this.flushUpdates();
-    }, this.BATCH_DELAY);
   }
 
   // 立即刷新更新（在流结束时调用）
   flushUpdates() {
     if (this.pendingUpdates.size === 0) return;
+
+    for (const [, update] of this.pendingUpdates) {
+      const traceMeta = getLatestMessageTrace(update.messageId);
+      if (!traceMeta) continue;
+      recordStreamTraceStage("optimizer_flush", {
+        traceId: traceMeta.traceId,
+        sessionId: traceMeta.sessionId,
+        messageId: update.messageId,
+        seq: traceMeta.seq,
+        model: traceMeta.model,
+        source: traceMeta.source,
+        contentLength: traceMeta.contentLength,
+        chunkLength: traceMeta.chunkLength,
+        remainLength: traceMeta.remainLength,
+      });
+    }
 
     if (this.updateTimer) {
       clearTimeout(this.updateTimer);
@@ -70,12 +117,15 @@ export class StreamUpdateOptimizer {
 export function createLightweightMessageUpdate(
   session: ChatSession,
   messageIndex: number,
-  newContent: string,
+  changes: StreamingMessageChanges,
 ): Partial<ChatSession> {
   // 避免深拷贝，只创建必要的浅拷贝
   const newMessages = [...session.messages];
   const targetMessage = { ...newMessages[messageIndex] };
-  targetMessage.content = newContent;
+  const { _trace, ...safeChanges } = changes as Partial<ChatMessage> & {
+    _trace?: unknown;
+  };
+  Object.assign(targetMessage, safeChanges);
   newMessages[messageIndex] = targetMessage;
 
   return {

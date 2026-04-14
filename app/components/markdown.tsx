@@ -7,7 +7,14 @@ import RemarkGfm from "remark-gfm";
 import RehypeHighlight from "rehype-highlight";
 import RehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
-import { useRef, useState, RefObject, useEffect, useMemo } from "react";
+import {
+  useRef,
+  useState,
+  RefObject,
+  useEffect,
+  useMemo,
+  useLayoutEffect,
+} from "react";
 import { copyToClipboard, useWindowSize } from "../utils";
 import mermaid from "mermaid";
 import Locale from "../locales";
@@ -24,10 +31,17 @@ import {
 import { useChatStore } from "../store";
 import { IconButton } from "./button";
 import { Collapse } from "antd";
+import CopyIcon from "../icons/copy.svg";
 
 import { useAppConfig } from "../store/config";
 import clsx from "clsx";
 import styles from "./markdown.module.scss";
+import type { ChatMessageSegment } from "../store";
+import { isThinkingTitle } from "../utils/thinking";
+import {
+  getLatestMessageTrace,
+  recordStreamTraceStage,
+} from "../utils/stream-trace";
 
 // 配置安全策略，允许 thinkcollapse 标签，防止html注入造成页面崩溃
 const sanitizeOptions = {
@@ -77,6 +91,27 @@ interface ThinkCollapseProps {
   children: React.ReactNode;
   className?: string;
   fontSize?: number;
+  collapseId?: string;
+}
+
+function formatThinkingDurationLabel(durationMs: number) {
+  return Locale.NewChat.ThinkFormat(durationMs);
+}
+
+function buildThinkCollapseTitle(segment: ChatMessageSegment, now: number) {
+  const content = segment.content.trim();
+  if (!content) {
+    return Locale.NewChat.NoThink;
+  }
+
+  if (segment.streaming) {
+    const duration = Math.max(0, now - (segment.startedAt ?? now));
+    return `${Locale.NewChat.Thinking}${formatThinkingDurationLabel(duration)}`;
+  }
+
+  return `${Locale.NewChat.Think}${formatThinkingDurationLabel(
+    segment.durationMs ?? 0,
+  )}`;
 }
 
 const ThinkCollapse = ({
@@ -84,28 +119,46 @@ const ThinkCollapse = ({
   children,
   className,
   fontSize,
+  collapseId,
 }: ThinkCollapseProps) => {
   const isSSR = typeof window === "undefined";
+  const isThinking = isThinkingTitle(title as string, Locale.NewChat.Thinking);
   // 如果是 Thinking 状态，默认展开，否则折叠
-  const defaultActive = title === Locale.NewChat.Thinking ? ["1"] : [];
+  const defaultActive = isThinking ? ["1"] : [];
   // 如果是 NoThink 状态，禁用
   const disabled = title === Locale.NewChat.NoThink;
-  const [activeKeys, setActiveKeys] = useState(defaultActive);
-
-  // 当标题从 Thinking 变为 Think 或 NoThink 时自动折叠
-  useEffect(() => {
-    if (
-      (typeof title === "string" && title.includes(Locale.NewChat.Think)) ||
-      title === Locale.NewChat.NoThink
-    ) {
-      setActiveKeys([]);
-    } else if (title === Locale.NewChat.Thinking) {
-      setActiveKeys(["1"]);
+  const hasManualToggleRef = useRef(false);
+  const [activeKeys, setActiveKeys] = useState<string[]>(() => {
+    if (collapseId && typeof window !== "undefined") {
+      const cached = sessionStorage.getItem(`think-collapse:${collapseId}`);
+      if (cached === "open") return ["1"];
+      if (cached === "closed") return [];
     }
-  }, [title]);
+    return defaultActive;
+  });
+
+  useEffect(() => {
+    if (!collapseId || typeof window === "undefined") return;
+    sessionStorage.setItem(
+      `think-collapse:${collapseId}`,
+      activeKeys.length ? "open" : "closed",
+    );
+  }, [activeKeys, collapseId]);
+
+  useEffect(() => {
+    if (disabled || hasManualToggleRef.current) return;
+
+    if (isThinking) {
+      setActiveKeys(["1"]);
+      return;
+    }
+
+    setActiveKeys([]);
+  }, [disabled, isThinking, collapseId]);
 
   const toggleCollapse = () => {
     if (!disabled) {
+      hasManualToggleRef.current = true;
       setActiveKeys(activeKeys.length ? [] : ["1"]);
     }
   };
@@ -172,7 +225,11 @@ const ThinkCollapse = ({
         className={`${disabled ? "disabled" : ""}`}
         size="small"
         activeKey={activeKeys}
-        onChange={(keys) => !disabled && setActiveKeys(keys as string[])}
+        onChange={(keys) => {
+          if (disabled) return;
+          hasManualToggleRef.current = true;
+          setActiveKeys(keys as string[]);
+        }}
         bordered={false}
         items={[
           {
@@ -181,13 +238,15 @@ const ThinkCollapse = ({
               <div className={styles["think-collapse-header"]}>
                 <span>{title}</span>
                 {!disabled && (
-                  <span
+                  <button
                     className={styles["copy-think-button"]}
                     onClick={handleCopyContent}
                     title={Locale.Chat.Actions.Copy}
+                    aria-label={Locale.Chat.Actions.Copy}
+                    type="button"
                   >
-                    📋
-                  </span>
+                    <CopyIcon />
+                  </button>
                 )}
               </div>
             ),
@@ -262,13 +321,16 @@ export function PreCode(props: { children: any }) {
     const htmlDom = ref.current.querySelector("code.language-html");
     const refText = ref.current.querySelector("code")?.innerText;
     if (htmlDom) {
-      setHtmlCode((htmlDom as HTMLElement).innerText);
+      const html = (htmlDom as HTMLElement).innerText;
+      setHtmlCode(isErrorHtmlDocument(html) ? "" : html);
     } else if (
       refText?.startsWith("<!DOCTYPE") ||
       refText?.startsWith("<svg") ||
       refText?.startsWith("<?xml")
     ) {
-      setHtmlCode(refText);
+      setHtmlCode(isErrorHtmlDocument(refText) ? "" : refText);
+    } else {
+      setHtmlCode("");
     }
   }, 600);
 
@@ -440,61 +502,109 @@ function tryWrapHtmlCode(text: string) {
     );
 }
 
-function formatThinkText(
-  text: string,
-  thinkingTime?: number,
-): {
+function isErrorHtmlDocument(text: string) {
+  const normalized = text.trim().toLowerCase();
+
+  if (
+    !normalized.startsWith("<!doctype html") &&
+    !normalized.startsWith("<html")
+  ) {
+    return false;
+  }
+
+  return (
+    normalized.includes('id="__next_error__"') ||
+    normalized.includes('name="next-error"') ||
+    normalized.includes("next_not_found") ||
+    normalized.includes(">404<") ||
+    normalized.includes("页面未找到") ||
+    normalized.includes("page not found")
+  );
+}
+
+function formatThinkText(text: string): {
   thinkText: string;
   remainText: string;
 } {
-  text = text.trimStart();
-  // 检查是否以 <think> 开头但没有结束标签
-  if (text.startsWith("<think>") && !text.includes("</think>")) {
-    // 获取 <think> 后的所有内容
-    const thinkContent = text.slice("<think>".length);
-    // 渲染为"思考中"状态
+  const normalized = text.trimStart();
+
+  if (!normalized.includes("<think>") && !normalized.includes("</think>")) {
+    return { thinkText: "", remainText: text };
+  }
+
+  const startIndex = normalized.indexOf("<think>");
+  if (startIndex >= 0 && !normalized.includes("</think>")) {
+    const prefix = normalized.slice(0, startIndex).trim();
+    const thinkContent = normalized.slice(startIndex + "<think>".length);
     const thinkText = `<thinkcollapse title="${Locale.NewChat.Thinking}">\n${thinkContent}\n\n</thinkcollapse>\n`;
-    const remainText = ""; // 剩余文本为空
+    const remainText = prefix ? `${prefix}\n\n` : "";
     return { thinkText, remainText };
   }
 
-  // 处理完整的 think 标签
-  const pattern = /^<think>([\s\S]*?)<\/think>/;
-  const match = text.match(pattern);
+  const pattern = /<think>([\s\S]*?)<\/think>/;
+  const match = normalized.match(pattern);
   if (match) {
+    const fullMatch = match[0];
     const thinkContent = match[1];
-    let thinkText = "";
-    if (thinkContent.trim() === "") {
-      thinkText = `<thinkcollapse title="${Locale.NewChat.NoThink}">\n\n</thinkcollapse>\n`;
-    } else {
-      thinkText = `<thinkcollapse title="${
-        Locale.NewChat.Think
-      }${Locale.NewChat.ThinkFormat(
-        thinkingTime,
-      )}">\n${thinkContent}\n\n</thinkcollapse>\n`;
-    }
-    const remainText = text.substring(match[0].length); // 提取剩余文本
-    return { thinkText, remainText };
+    const prefix = normalized.slice(0, match.index ?? 0).trim();
+    const suffix = normalized
+      .slice((match.index ?? 0) + fullMatch.length)
+      .trimStart();
+    const thinkText =
+      thinkContent.trim() === ""
+        ? `<thinkcollapse title="${Locale.NewChat.NoThink}">\n\n</thinkcollapse>\n`
+        : `<thinkcollapse title="${Locale.NewChat.Think}">\n${thinkContent}\n\n</thinkcollapse>\n`;
+
+    const remainParts = [prefix, suffix].filter(Boolean);
+    return {
+      thinkText,
+      remainText: remainParts.join("\n\n"),
+    };
   }
 
-  // 没有找到 think 标签
   return { thinkText: "", remainText: text };
 }
 
 function MarkdownContentInner(props: {
   content: string;
-  thinkingTime?: number;
+  thinkingSegments?: ChatMessageSegment[];
   fontSize?: number;
   status?: boolean;
 }) {
+  const [now, setNow] = useState(Date.now());
+  const hasStreamingThought = !!props.thinkingSegments?.some(
+    (segment) => segment.type === "thought" && segment.streaming,
+  );
+
+  useEffect(() => {
+    if (!hasStreamingThought) return;
+
+    setNow(Date.now());
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [hasStreamingThought]);
+
   // 预处理base64图片，将长base64 URL替换为占位符
   const { processedContent, imageMap } = useMemo(() => {
     const originalContent = tryWrapHtmlCode(escapeBrackets(props.content));
-    const { thinkText, remainText } = formatThinkText(
-      originalContent,
-      props.thinkingTime,
-    );
-    let content = thinkText + remainText;
+    let content = originalContent;
+
+    if (props.thinkingSegments?.length) {
+      const thinkText = props.thinkingSegments
+        .map((segment) => {
+          const title = buildThinkCollapseTitle(segment, now);
+          const body = segment.content.trim();
+          return `<thinkcollapse title="${title}">\n${body}\n\n</thinkcollapse>\n`;
+        })
+        .join("\n");
+      content = thinkText + originalContent;
+    } else {
+      const { thinkText, remainText } = formatThinkText(originalContent);
+      content = thinkText + remainText;
+    }
 
     const imageMap = new Map<string, string>();
     let imageCounter = 0;
@@ -516,90 +626,152 @@ function MarkdownContentInner(props: {
     );
 
     return { processedContent: content, imageMap };
-  }, [props.content, props.thinkingTime]);
+  }, [now, props.content, props.thinkingSegments]);
+
+  const isStreaming = !!props.status;
+  const remarkPlugins = useMemo(
+    () => [RemarkMath, RemarkGfm, RemarkBreaks],
+    [],
+  );
+  const rehypePlugins = useMemo(
+    () => [
+      RehypeRaw,
+      RehypeKatex as any,
+      [rehypeSanitize, sanitizeOptions],
+      [
+        RehypeHighlight,
+        {
+          detect: false,
+          ignoreMissing: true,
+        },
+      ],
+    ],
+    [],
+  );
+
+  const components = useMemo(() => {
+    if (isStreaming) {
+      return {
+        // 流式阶段走轻量渲染，避免复杂代码块/预览逻辑拖慢逐字更新。
+        pre: (preProps: any) => <pre {...preProps} />,
+        code: ({ className, children, ...rest }: any) => (
+          <code className={className} {...rest}>
+            {children}
+          </code>
+        ),
+        p: (pProps: any) => <p {...pProps} dir="auto" />,
+        img: (imgProps: any) => {
+          const { src, alt, ...otherProps } = imgProps;
+          const actualSrc = src && imageMap.has(src) ? imageMap.get(src) : src;
+
+          if (actualSrc) {
+            return (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                {...otherProps}
+                src={actualSrc}
+                alt={alt || "image"}
+                style={{
+                  maxWidth: "100%",
+                  height: "auto",
+                  borderRadius: "8px",
+                }}
+              />
+            );
+          }
+
+          return <span>{alt || "[Image]"}</span>;
+        },
+        a: (aProps: any) => {
+          const href = aProps.href || "";
+          const isInternal = /^\/#/i.test(href);
+          const target = isInternal ? "_self" : aProps.target ?? "_blank";
+          return <a {...aProps} target={target} />;
+        },
+        thinkcollapse: ({
+          title,
+          children,
+        }: {
+          title: string;
+          children: React.ReactNode;
+        }) => (
+          <ThinkCollapse title={title} fontSize={props.fontSize}>
+            {children}
+          </ThinkCollapse>
+        ),
+      } as const;
+    }
+
+    return {
+      pre: PreCode,
+      code: CustomCode,
+      p: (pProps: any) => <p {...pProps} dir="auto" />,
+      img: (imgProps: any) => {
+        const { src, alt, ...otherProps } = imgProps;
+
+        let actualSrc = src;
+        if (src && imageMap.has(src)) {
+          actualSrc = imageMap.get(src);
+        }
+
+        if (actualSrc) {
+          return (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              {...otherProps}
+              src={actualSrc}
+              alt={alt || "image"}
+              style={{
+                maxWidth: "100%",
+                height: "auto",
+                borderRadius: "8px",
+                cursor: "pointer",
+              }}
+              onClick={() => showImageModal(actualSrc)}
+            />
+          );
+        }
+        return <span>{alt || "[Image]"}</span>;
+      },
+      thinkcollapse: ({
+        title,
+        children,
+      }: {
+        title: string;
+        children: React.ReactNode;
+      }) => (
+        <ThinkCollapse title={title} fontSize={props.fontSize}>
+          {children}
+        </ThinkCollapse>
+      ),
+      a: (aProps: any) => {
+        const href = aProps.href || "";
+        if (/\.(aac|mp3|opus|wav)$/.test(href)) {
+          return (
+            <figure>
+              <audio controls src={href}></audio>
+            </figure>
+          );
+        }
+        if (/\.(3gp|3g2|webm|ogv|mpeg|mp4|avi)$/.test(href)) {
+          return (
+            <video controls width="99.9%">
+              <source src={href} />
+            </video>
+          );
+        }
+        const isInternal = /^\/#/i.test(href);
+        const target = isInternal ? "_self" : aProps.target ?? "_blank";
+        return <a {...aProps} target={target} />;
+      },
+    } as const;
+  }, [imageMap, isStreaming, props.fontSize]);
 
   return (
     <ReactMarkdown
-      remarkPlugins={[RemarkMath, RemarkGfm, RemarkBreaks]}
-      rehypePlugins={[
-        RehypeRaw,
-        RehypeKatex as any,
-        [rehypeSanitize, sanitizeOptions],
-        [
-          RehypeHighlight,
-          {
-            detect: false,
-            ignoreMissing: true,
-          },
-        ],
-      ]}
-      components={
-        {
-          pre: PreCode,
-          code: CustomCode,
-          p: (pProps: any) => <p {...pProps} dir="auto" />,
-          img: (imgProps: any) => {
-            const { src, alt, ...otherProps } = imgProps;
-
-            // 检查是否是我们的占位符
-            let actualSrc = src;
-            if (src && imageMap.has(src)) {
-              actualSrc = imageMap.get(src);
-            }
-
-            // 处理base64图片或普通图片URL
-            if (actualSrc) {
-              return (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  {...otherProps}
-                  src={actualSrc}
-                  alt={alt || "image"}
-                  style={{
-                    maxWidth: "100%",
-                    height: "auto",
-                    borderRadius: "8px",
-                    cursor: "pointer",
-                  }}
-                  onClick={() => showImageModal(actualSrc)}
-                />
-              );
-            }
-            return <span>{alt || "[Image]"}</span>;
-          },
-          thinkcollapse: ({
-            title,
-            children,
-          }: {
-            title: string;
-            children: React.ReactNode;
-          }) => (
-            <ThinkCollapse title={title} fontSize={props.fontSize}>
-              {children}
-            </ThinkCollapse>
-          ),
-          a: (aProps: any) => {
-            const href = aProps.href || "";
-            if (/\.(aac|mp3|opus|wav)$/.test(href)) {
-              return (
-                <figure>
-                  <audio controls src={href}></audio>
-                </figure>
-              );
-            }
-            if (/\.(3gp|3g2|webm|ogv|mpeg|mp4|avi)$/.test(href)) {
-              return (
-                <video controls width="99.9%">
-                  <source src={href} />
-                </video>
-              );
-            }
-            const isInternal = /^\/#/i.test(href);
-            const target = isInternal ? "_self" : (aProps.target ?? "_blank");
-            return <a {...aProps} target={target} />;
-          },
-        } as any
-      }
+      remarkPlugins={remarkPlugins as any}
+      rehypePlugins={rehypePlugins as any}
+      components={components as any}
     >
       {processedContent}
     </ReactMarkdown>
@@ -607,6 +779,60 @@ function MarkdownContentInner(props: {
 }
 
 export const MarkdownContent = React.memo(MarkdownContentInner);
+
+export function ThoughtSegmentBlock(props: {
+  segment: ChatMessageSegment;
+  fontSize?: number;
+  fontFamily?: string;
+}) {
+  const { segment } = props;
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!segment.streaming) return;
+
+    setNow(Date.now());
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [segment.id, segment.streaming]);
+
+  const title = buildThinkCollapseTitle(segment, now);
+
+  return (
+    <div
+      className={styles["thought-segment"]}
+      style={{
+        fontSize: `${props.fontSize ?? 14}px`,
+        fontFamily: props.fontFamily || "inherit",
+      }}
+      dir="auto"
+    >
+      <ThinkCollapse
+        title={title}
+        fontSize={props.fontSize}
+        collapseId={segment.id}
+      >
+        <div
+          className="markdown-body"
+          style={{
+            fontSize: `${props.fontSize ?? 14}px`,
+            fontFamily: props.fontFamily || "inherit",
+          }}
+          dir="auto"
+        >
+          <MarkdownContent
+            content={segment.content}
+            fontSize={props.fontSize}
+            status={segment.streaming}
+          />
+        </div>
+      </ThinkCollapse>
+    </div>
+  );
+}
 
 export function Markdown(
   props: {
@@ -616,11 +842,71 @@ export function Markdown(
     fontFamily?: string;
     parentRef?: RefObject<HTMLDivElement>;
     defaultShow?: boolean;
-    thinkingTime?: number;
+    thinkingSegments?: ChatMessageSegment[];
     status?: boolean;
+    traceMessageId?: string;
   } & React.DOMAttributes<HTMLDivElement>,
 ) {
   const mdRef = useRef<HTMLDivElement>(null);
+  const lastRenderTraceSeqRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (!props.status || !props.traceMessageId || props.loading) return;
+
+    const traceMeta = getLatestMessageTrace(props.traceMessageId);
+    if (!traceMeta) return;
+    if (lastRenderTraceSeqRef.current === traceMeta.seq) return;
+    lastRenderTraceSeqRef.current = traceMeta.seq;
+
+    recordStreamTraceStage("assistant_render_commit", {
+      traceId: traceMeta.traceId,
+      sessionId: traceMeta.sessionId,
+      messageId: props.traceMessageId,
+      seq: traceMeta.seq,
+      model: traceMeta.model,
+      source: traceMeta.source,
+      contentLength: traceMeta.contentLength,
+      chunkLength: traceMeta.chunkLength,
+      remainLength: traceMeta.remainLength,
+      note: "assistant markdown host committed",
+    });
+
+    recordStreamTraceStage("markdown_render_commit", {
+      traceId: traceMeta.traceId,
+      sessionId: traceMeta.sessionId,
+      messageId: props.traceMessageId,
+      seq: traceMeta.seq,
+      model: traceMeta.model,
+      source: traceMeta.source,
+      contentLength: traceMeta.contentLength,
+      chunkLength: traceMeta.chunkLength,
+      remainLength: traceMeta.remainLength,
+      note: "markdown subtree committed",
+    });
+
+    const frameHandle = window.requestAnimationFrame(() => {
+      recordStreamTraceStage("paint_approx", {
+        traceId: traceMeta.traceId,
+        sessionId: traceMeta.sessionId,
+        messageId: props.traceMessageId,
+        seq: traceMeta.seq,
+        model: traceMeta.model,
+        source: traceMeta.source,
+        contentLength: traceMeta.contentLength,
+        chunkLength: traceMeta.chunkLength,
+        remainLength: traceMeta.remainLength,
+        note: "next frame after markdown commit",
+      });
+    });
+
+    return () => window.cancelAnimationFrame(frameHandle);
+  }, [
+    props.content,
+    props.status,
+    props.traceMessageId,
+    props.thinkingSegments,
+    props.loading,
+  ]);
 
   return (
     <div
@@ -639,7 +925,7 @@ export function Markdown(
       ) : (
         <MarkdownContent
           content={props.content}
-          thinkingTime={props.thinkingTime}
+          thinkingSegments={props.thinkingSegments}
           fontSize={props.fontSize}
           status={props.status}
         />

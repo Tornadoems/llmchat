@@ -10,7 +10,60 @@ declare module "*.scss" {
 
 declare module "*.svg";
 
+type DangerConfig = {
+  hideUserApiKey: boolean;
+  disableGPT4: boolean;
+  hideBalanceQuery: boolean;
+  disableFastLink: boolean;
+  customModels: string;
+  defaultModel: string;
+  visionModels: string;
+  hasServerAccessCode: boolean;
+  hasServerProviderConfig: boolean;
+  accessMode?: "legacy" | "group";
+  hasAccessGroupsConfig?: boolean;
+  currentGroupId?: string;
+  currentGroupName?: string;
+  groupBootstrap?: {
+    groupId: string;
+    groupName: string;
+    defaultProvider: string;
+    defaultModel: string;
+    summaryModel: string;
+    enabledModels: Record<string, string[]>;
+    mcpServers: Record<string, any>;
+    serverProviders: Record<
+      string,
+      { hasApiKey: boolean; hasBaseUrl: boolean }
+    >;
+    hasServerProviderConfig: boolean;
+  } | null;
+  serverProviders: {
+    openai: { hasApiKey: boolean; hasBaseUrl: boolean };
+    google: { hasApiKey: boolean; hasBaseUrl: boolean };
+    anthropic: { hasApiKey: boolean; hasBaseUrl: boolean };
+    bytedance: { hasApiKey: boolean; hasBaseUrl: boolean };
+    alibaba: { hasApiKey: boolean; hasBaseUrl: boolean };
+    moonshot: { hasApiKey: boolean; hasBaseUrl: boolean };
+    deepseek: { hasApiKey: boolean; hasBaseUrl: boolean };
+    xai: { hasApiKey: boolean; hasBaseUrl: boolean };
+    siliconflow: { hasApiKey: boolean; hasBaseUrl: boolean };
+  };
+};
+
 declare interface Window {
+  __QADCHAT_STREAM_TRACE_ENABLED__?: boolean;
+  __QADCHAT_STREAM_TRACE__?: {
+    enable: () => void;
+    disable: () => void;
+    clear: () => void;
+    isEnabled: () => boolean;
+    events: (traceId?: string) => any[];
+    latestMeta: (messageId: string) => any;
+    summary: (traceId?: string) => any;
+    exportJSON: (traceId?: string) => string;
+    printSummary: (traceId?: string) => void;
+  };
   __TAURI__?: {
     writeText(text: string): Promise<void>;
     invoke(command: string, payload?: Record<string, unknown>): Promise<any>;

@@ -49,6 +49,11 @@ export interface AnthropicChatRequest {
     type: "enabled";
     budget_tokens: number;
   }; // Extended thinking configuration for Claude models.
+  tools?: Array<{
+    name: string;
+    description?: string;
+    input_schema?: Record<string, unknown>;
+  }>;
 }
 
 export interface ChatRequest {
@@ -97,13 +102,15 @@ export class ClaudeApi implements LLMApi {
 
     const shouldStream = !!options.config.stream;
 
+    const sessionModelConfig = useChatStore.getState().currentSession()
+      .mask.modelConfig;
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
-      },
+      ...sessionModelConfig,
+      ...options.config,
+      model: options.config.model || sessionModelConfig.model,
+      providerName:
+        options.config.providerName || sessionModelConfig.providerName,
     };
 
     // try get base64image from local cache image_url
@@ -206,6 +213,9 @@ export class ClaudeApi implements LLMApi {
       // top_k: modelConfig.top_k,
       top_k: 5,
     };
+    if (options.nativeTools?.provider === "anthropic") {
+      requestBody.tools = options.nativeTools.tools;
+    }
 
     // 如果模型具有推理能力且是Claude类型，添加thinking配置
     if (
@@ -230,8 +240,14 @@ export class ClaudeApi implements LLMApi {
 
     if (shouldStream) {
       let index = -1;
-      const tools: any[] = [];
-      const funcs: Record<string, Function> = {};
+      const tools =
+        options.nativeTools?.provider === "anthropic"
+          ? options.nativeTools.tools
+          : [];
+      const funcs =
+        options.nativeTools?.provider === "anthropic"
+          ? options.nativeTools.funcs
+          : {};
       const modelCapabilities = getModelCapabilitiesWithCustomConfig(
         options.config.model,
       );
@@ -239,15 +255,13 @@ export class ClaudeApi implements LLMApi {
         path,
         requestBody,
         {
-          ...getHeaders(),
+          ...getHeaders(false, {
+            model: options.config.model,
+            providerName: options.config.providerName,
+          }),
           "anthropic-version": accessStore.anthropicApiVersion,
         },
-        // @ts-ignore
-        tools.map((tool) => ({
-          name: tool?.function?.name,
-          description: tool?.function?.description,
-          input_schema: tool?.function?.parameters,
-        })),
+        tools,
         funcs,
         controller,
         // parseSSE
@@ -326,6 +340,10 @@ export class ClaudeApi implements LLMApi {
         ) => {
           // reset index value
           index = -1;
+          // 从工具调用消息中移除思考内容，不发送给模型
+          const cleanedContent = (toolCallMessage.content || "")
+            .replace(/<think>[\s\S]*?<\/think>/g, "")
+            .trim();
           // @ts-ignore
           requestPayload?.messages?.splice(
             // @ts-ignore
@@ -333,16 +351,19 @@ export class ClaudeApi implements LLMApi {
             0,
             {
               role: "assistant",
-              content: toolCallMessage.tool_calls.map(
-                (tool: ChatMessageTool) => ({
+              content: [
+                ...(cleanedContent
+                  ? [{ type: "text", text: cleanedContent }]
+                  : []),
+                ...toolCallMessage.tool_calls.map((tool: ChatMessageTool) => ({
                   type: "tool_use",
                   id: tool.id,
                   name: tool?.function?.name,
                   input: tool?.function?.arguments
                     ? JSON.parse(tool?.function?.arguments)
                     : {},
-                }),
-              ),
+                })),
+              ],
             },
             // @ts-ignore
             ...toolCallResult.map((result) => ({

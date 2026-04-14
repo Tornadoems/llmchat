@@ -12,7 +12,11 @@ import {
   useChatStore,
   ChatMessageTool,
 } from "@/app/store";
-import { stream, streamWithThink } from "@/app/utils/chat";
+import {
+  stream,
+  streamWithThink,
+  toOpenAICompatibleMessage,
+} from "@/app/utils/chat";
 import {
   ChatOptions,
   getHeaders,
@@ -23,8 +27,9 @@ import {
 import { getClientConfig } from "@/app/config/client";
 import { getMessageTextContent } from "@/app/utils";
 import { getModelCapabilitiesWithCustomConfig } from "@/app/config/model-capabilities";
-import { RequestPayload } from "./openai";
+import { OpenAICompatibleMessage, RequestPayload } from "./openai";
 import { fetch } from "@/app/utils/stream";
+import { collectOpenAIStyleToolCalls } from "@/app/utils/chat";
 
 export class MoonshotApi implements LLMApi {
   private disableListModels = true;
@@ -65,19 +70,26 @@ export class MoonshotApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
-    const messages: ChatOptions["messages"] = [];
+    const messages: OpenAICompatibleMessage[] = [];
     for (const v of options.messages) {
       const content = getMessageTextContent(v);
-      messages.push({ role: v.role, content });
+      messages.push(
+        toOpenAICompatibleMessage({
+          ...v,
+          content,
+        }),
+      );
     }
 
+    const sessionModelConfig = useChatStore.getState().currentSession()
+      .mask.modelConfig;
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
-      },
+      ...sessionModelConfig,
+      ...options.config,
+      model: options.config.model || sessionModelConfig.model,
+      providerName:
+        options.config.providerName || sessionModelConfig.providerName,
     };
 
     const requestPayload: RequestPayload = {
@@ -117,8 +129,14 @@ export class MoonshotApi implements LLMApi {
       );
 
       if (shouldStream) {
-        const tools: any[] = [];
-        const funcs: Record<string, Function> = {};
+        const tools =
+          options.nativeTools?.provider === "openai"
+            ? options.nativeTools.tools
+            : [];
+        const funcs =
+          options.nativeTools?.provider === "openai"
+            ? options.nativeTools.funcs
+            : {};
         const modelCapabilities = getModelCapabilitiesWithCustomConfig(
           options.config.model,
         );
@@ -144,22 +162,7 @@ export class MoonshotApi implements LLMApi {
             }>;
             const tool_calls = choices[0]?.delta?.tool_calls;
             if (tool_calls?.length > 0) {
-              const index = tool_calls[0]?.index;
-              const id = tool_calls[0]?.id;
-              const args = tool_calls[0]?.function?.arguments;
-              if (id) {
-                runTools.push({
-                  id,
-                  type: tool_calls[0]?.type,
-                  function: {
-                    name: tool_calls[0]?.function?.name as string,
-                    arguments: args,
-                  },
-                });
-              } else {
-                // @ts-ignore
-                runTools[index]["function"]["arguments"] += args;
-              }
+              collectOpenAIStyleToolCalls(runTools, tool_calls);
             }
             return {
               isThinking: false,
@@ -172,12 +175,19 @@ export class MoonshotApi implements LLMApi {
             toolCallMessage: any,
             toolCallResult: any[],
           ) => {
+            // 从工具调用消息中移除思考内容，不发送给模型
+            const cleanedToolCallMessage = {
+              ...toolCallMessage,
+              content: (toolCallMessage.content || "")
+                .replace(/<think>[\s\S]*?<\/think>/g, "")
+                .trim(),
+            };
             // @ts-ignore
             requestPayload?.messages?.splice(
               // @ts-ignore
               requestPayload?.messages?.length,
               0,
-              toolCallMessage,
+              cleanedToolCallMessage,
               ...toolCallResult,
             );
           },

@@ -1,5 +1,7 @@
 import {
+  createAttachmentTextSegment,
   getMessageTextContent,
+  getMessageTextContentWithoutThinkingFromContent,
   getMessageTextContentWithoutThinking,
   getMessageImages,
   isDalle3,
@@ -8,30 +10,47 @@ import {
 } from "../utils";
 
 import { indexedDBStorage } from "@/app/utils/indexedDB-storage";
+import { expandMessagesWithToolHistory } from "@/app/utils/chat";
+import {
+  createStreamTraceId,
+  getLatestMessageTrace,
+  recordStreamTraceStage,
+} from "@/app/utils/stream-trace";
 import {
   StreamUpdateOptimizer,
   createLightweightMessageUpdate,
 } from "@/app/utils/stream-optimizer";
+import {
+  createMessageSegment,
+  cloneMessageSegments,
+  contentStartsWithThink,
+  splitMessageContentIntoSegments,
+  splitSegmentsByLastTool,
+  rebuildRoundSegments,
+  appendToolRoundSegments,
+  isCurrentRoundStable,
+  updateMessageSegmentsFromStream,
+  serializeSegmentsToMessageContent,
+  buildMessageSegmentsFromContent,
+  finalizeMessageSegments,
+} from "@/app/utils/segment-parser";
 import { nanoid } from "nanoid";
 import type {
+  ChatAttachment,
   ClientApi,
   MultimodalContent,
   RequestMessage,
+  RichMessage,
 } from "../client/api";
-import { getClientApi } from "../client/api";
+import { getClientApi, normalizeProviderName } from "../client/api";
 import { ChatControllerPool } from "../client/controller";
 import { showToast } from "../components/ui-lib";
 import {
   DEFAULT_INPUT_TEMPLATE,
   DEFAULT_MODELS,
-  GEMINI_SUMMARIZE_MODEL,
-  DEEPSEEK_SUMMARIZE_MODEL,
   KnowledgeCutOffDate,
-  MCP_SYSTEM_TEMPLATE,
-  MCP_TOOLS_TEMPLATE,
   ServiceProvider,
   StoreKey,
-  SUMMARIZE_MODEL,
 } from "../constant";
 import Locale, { getLang } from "../locales";
 import { prettyObject } from "../utils/format";
@@ -44,11 +63,13 @@ import {
   getSessionCompressModelConfig,
 } from "../utils/model-resolver";
 import { getModelCompressThreshold } from "../config/model-context-tokens";
-import { useAccessStore } from "./access";
-import { collectModelsWithDefaultModel } from "../utils/model";
 import { createDefaultMask, Mask } from "./mask";
-import { executeMcpAction, getAllTools } from "../mcp/actions";
-import { extractMcpJson, isMcpJson } from "../mcp/utils";
+import {
+  getEnabledMcpNativeTools,
+  getOriginalToolNameByName,
+  getToolClientIdByName,
+  type NativeToolProvider,
+} from "../mcp/native-tools";
 
 const localStorage = safeLocalStorage();
 
@@ -56,13 +77,29 @@ export type ChatMessageTool = {
   id: string;
   index?: number;
   type?: string;
+  clientId?: string;
+  displayName?: string;
+  argumentsObj?: Record<string, unknown>;
   function?: {
     name: string;
     arguments?: string;
   };
   content?: string;
+  response?: any;
   isError?: boolean;
   errorMsg?: string;
+};
+
+export type ChatMessageSegmentType = "thought" | "text" | "tool";
+
+export type ChatMessageSegment = {
+  id: string;
+  type: ChatMessageSegmentType;
+  content: string;
+  streaming?: boolean;
+  durationMs?: number;
+  startedAt?: number;
+  toolIds?: string[];
 };
 
 export type ChatMessage = RequestMessage & {
@@ -73,7 +110,6 @@ export type ChatMessage = RequestMessage & {
   model?: ModelType;
   tools?: ChatMessageTool[];
   audio_url?: string;
-  isMcpResponse?: boolean;
   // 多模型模式下的模型标识
   modelKey?: string; // 格式: "model@provider"
   // 是否为多模型模式下的消息
@@ -91,6 +127,8 @@ export type ChatMessage = RequestMessage & {
   // 重试版本管理 - 简化版本
   versions?: string[]; // 存储所有版本的内容
   currentVersionIndex?: number; // 当前显示的版本索引
+  toolCallContent?: string;
+  segments?: ChatMessageSegment[];
 };
 
 export function createMessage(override: Partial<ChatMessage>): ChatMessage {
@@ -142,6 +180,65 @@ export interface ChatSession {
   searchEnabled?: boolean;
 }
 
+function getResponseContent(message: string | RichMessage) {
+  if (typeof message === "string") {
+    return message;
+  }
+
+  return message.displayContent ?? message.content;
+}
+
+function getResponseContentWithoutThinking(message: string | RichMessage) {
+  return getMessageTextContentWithoutThinkingFromContent(
+    getResponseContent(message),
+  );
+}
+
+function applyAssistantStatistics(
+  targetMessage: ChatMessage,
+  message: string | RichMessage,
+) {
+  const responseContent = getResponseContent(message);
+  targetMessage.content = responseContent;
+
+  if (typeof message === "string") {
+    if (!targetMessage.statistic?.completionTokens) {
+      targetMessage.statistic = {
+        ...(targetMessage.statistic ?? {}),
+        completionTokens: Math.round(
+          estimateTokenLength(
+            getMessageTextContentWithoutThinkingFromContent(responseContent),
+          ),
+        ),
+      };
+    }
+    return;
+  }
+
+  targetMessage.statistic = {
+    ...(targetMessage.statistic ?? {}),
+    completionTokens:
+      message.usage?.completion_tokens ??
+      targetMessage.statistic?.completionTokens ??
+      Math.round(
+        estimateTokenLength(
+          getMessageTextContentWithoutThinkingFromContent(responseContent),
+        ),
+      ),
+    firstReplyLatency:
+      message.usage?.first_content_latency ??
+      targetMessage.statistic?.firstReplyLatency,
+    totalReplyLatency:
+      message.usage?.total_latency ??
+      targetMessage.statistic?.totalReplyLatency,
+    reasoningLatency:
+      message.usage?.thinking_time ?? targetMessage.statistic?.reasoningLatency,
+    searchingLatency:
+      message.usage?.searching_time ??
+      targetMessage.statistic?.searchingLatency,
+  };
+}
+
 export const DEFAULT_TOPIC = Locale.Store.DefaultTopic;
 export const BOT_HELLO: ChatMessage = createMessage({
   role: "assistant",
@@ -175,36 +272,38 @@ function createEmptySession(): ChatSession {
   };
 }
 
-function getSummarizeModel(
-  currentModel: string,
-  providerName: string,
-): string[] {
-  // if it is using gpt-* models, force to use 4o-mini to summarize
-  if (currentModel.startsWith("gpt") || currentModel.startsWith("chatgpt")) {
-    const configStore = useAppConfig.getState();
-    const accessStore = useAccessStore.getState();
-    const allModel = collectModelsWithDefaultModel(
-      configStore.models,
-      [configStore.customModels, accessStore.customModels].join(","),
-      accessStore.defaultModel,
-    );
-    const summarizeModel = allModel.find(
-      (m) => m.name === SUMMARIZE_MODEL && m.available,
-    );
-    if (summarizeModel) {
-      return [
-        summarizeModel.name,
-        summarizeModel.provider?.providerName as string,
-      ];
-    }
-  }
-  if (currentModel.startsWith("gemini")) {
-    return [GEMINI_SUMMARIZE_MODEL, ServiceProvider.Google];
-  } else if (currentModel.startsWith("deepseek-")) {
-    return [DEEPSEEK_SUMMARIZE_MODEL, ServiceProvider.DeepSeek];
+function buildUserMessageContent(
+  content: string,
+  attachments?: ChatAttachment[],
+): string | MultimodalContent[] {
+  if (!attachments || attachments.length === 0) {
+    return content;
   }
 
-  return [currentModel, providerName];
+  const multimodalContent: MultimodalContent[] = [];
+
+  if (content.trim().length > 0) {
+    multimodalContent.push({
+      type: "text",
+      text: content,
+    });
+  }
+
+  for (const attachment of attachments) {
+    if (attachment.type === "image") {
+      multimodalContent.push({
+        type: "image_url",
+        image_url: { url: attachment.data },
+      });
+    } else {
+      multimodalContent.push({
+        type: "text",
+        text: createAttachmentTextSegment(attachment.name, attachment.data),
+      });
+    }
+  }
+
+  return multimodalContent;
 }
 
 function countMessages(msgs: ChatMessage[]) {
@@ -258,52 +357,98 @@ function fillTemplateWith(input: string, modelConfig: ModelConfig) {
   return output;
 }
 
-async function getMcpSystemPrompt(
-  mcpEnabled: boolean = false,
-  enabledClients?: Record<string, boolean>,
-): Promise<string> {
-  // 如果 MCP 功能未启用，返回空字符串
-  if (!mcpEnabled) {
-    return "";
+function resolveNativeToolProvider(providerName?: string): NativeToolProvider {
+  const normalizedProvider = providerName
+    ? normalizeProviderName(providerName)
+    : ServiceProvider.OpenAI;
+  switch (normalizedProvider) {
+    case ServiceProvider.Anthropic:
+      return "anthropic";
+    case ServiceProvider.Google:
+      return "gemini";
+    case ServiceProvider.OpenAI:
+    case ServiceProvider.ByteDance:
+    case ServiceProvider.Alibaba:
+    case ServiceProvider.Moonshot:
+    case ServiceProvider.DeepSeek:
+    case ServiceProvider.XAI:
+    case ServiceProvider.SiliconFlow:
+    default:
+      return "openai";
+  }
+}
+
+function stringifyToolResult(result: any) {
+  if (typeof result === "string") return result;
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+}
+
+function resolveFinalMessageSegments(
+  currentSegments: ChatMessageSegment[] | undefined,
+  message: string | RichMessage,
+  reasoningLatency?: number,
+) {
+  const responseContent = getResponseContent(message);
+  const { prefix, currentRound } = splitSegmentsByLastTool(currentSegments);
+  const rebuiltSegments = rebuildRoundSegments(
+    currentRound,
+    responseContent,
+    reasoningLatency,
+    true,
+  );
+
+  if (rebuiltSegments?.length) {
+    return [...prefix, ...rebuiltSegments];
   }
 
-  const tools = await getAllTools();
+  return finalizeMessageSegments(currentSegments, reasoningLatency);
+}
 
-  let toolsStr = "";
-  let totalToolCount = 0;
-
-  tools.forEach((i) => {
-    // error client has no tools
-    if (!i.tools) return;
-
-    // 如果提供了启用状态配置，则检查该客户端是否启用
-    if (enabledClients && enabledClients[i.clientId] === false) {
-      return;
+function enrichToolWithMetadata(
+  tool: ChatMessageTool,
+  metadata: Record<
+    string,
+    {
+      clientId: string;
+      originalName: string;
     }
-
-    // 统计工具数量
-    totalToolCount += i.tools.tools.length;
-
-    toolsStr += MCP_TOOLS_TEMPLATE.replace(
-      /\{\{ clientId \}\}/g,
-      i.clientId,
-    ).replace(
-      "{{ tools }}",
-      i.tools.tools.map((p: object) => JSON.stringify(p, null, 2)).join("\n"),
-    );
-  });
-
-  // 根据工具数量决定是否使用强化模式
-  let systemTemplate = MCP_SYSTEM_TEMPLATE;
-  if (totalToolCount > 0) {
-    // 对于少量工具，使用更强化的提示词
-    systemTemplate = systemTemplate.replace(
-      "## Tool Use Rules",
-      `## Tool Use Rules (${totalToolCount} tools available)\n**IMPORTANT: You have ${totalToolCount} powerful tools available. Use them actively to help users!**`,
-    );
+  >,
+): ChatMessageTool {
+  const toolName = tool?.function?.name || "";
+  let parsedArguments: Record<string, unknown> | undefined;
+  if (tool?.function?.arguments) {
+    try {
+      parsedArguments = JSON.parse(tool.function.arguments);
+    } catch {}
   }
 
-  return systemTemplate.replace("{{ MCP_TOOLS }}", toolsStr);
+  return {
+    ...tool,
+    clientId: getToolClientIdByName(metadata as any, toolName),
+    displayName: getOriginalToolNameByName(metadata as any, toolName),
+    argumentsObj: parsedArguments,
+  };
+}
+
+function upsertToolInMessage(
+  currentTools: ChatMessageTool[] | undefined,
+  tool: ChatMessageTool,
+) {
+  const tools = currentTools ? [...currentTools] : [];
+  const index = tools.findIndex((item) => item.id === tool.id);
+  if (index >= 0) {
+    tools[index] = {
+      ...tools[index],
+      ...tool,
+    };
+  } else {
+    tools.push(tool);
+  }
+  return tools;
 }
 
 const DEFAULT_CHAT_STATE = {
@@ -329,6 +474,36 @@ export const useChatStore = createPersistStore(
       const sessions = get().sessions;
       let hasChanges = false;
 
+      for (const [, update] of updates) {
+        const traceInfo = (
+          update.changes as Partial<ChatMessage> & {
+            _trace?: {
+              traceId: string;
+              seq: number;
+              model?: string;
+              source?: string;
+              sessionId?: string;
+              contentLength: number;
+              chunkLength: number;
+              remainLength: number;
+            };
+          }
+        )._trace;
+        if (!traceInfo) continue;
+
+        recordStreamTraceStage("store_batch_apply_start", {
+          traceId: traceInfo.traceId,
+          sessionId: traceInfo.sessionId,
+          messageId: update.messageId,
+          seq: traceInfo.seq,
+          model: traceInfo.model,
+          source: traceInfo.source,
+          contentLength: traceInfo.contentLength,
+          chunkLength: traceInfo.chunkLength,
+          remainLength: traceInfo.remainLength,
+        });
+      }
+
       const newSessions = sessions.map((session) => {
         for (const [key, update] of updates) {
           if (key.startsWith(session.id)) {
@@ -341,7 +516,7 @@ export const useChatStore = createPersistStore(
                 ...createLightweightMessageUpdate(
                   session,
                   messageIndex,
-                  update.content,
+                  update.changes,
                 ),
               };
               hasChanges = true;
@@ -354,6 +529,36 @@ export const useChatStore = createPersistStore(
 
       if (hasChanges) {
         set({ sessions: newSessions });
+      }
+
+      for (const [, update] of updates) {
+        const traceInfo = (
+          update.changes as Partial<ChatMessage> & {
+            _trace?: {
+              traceId: string;
+              seq: number;
+              model?: string;
+              source?: string;
+              sessionId?: string;
+              contentLength: number;
+              chunkLength: number;
+              remainLength: number;
+            };
+          }
+        )._trace;
+        if (!traceInfo) continue;
+
+        recordStreamTraceStage("store_batch_apply_done", {
+          traceId: traceInfo.traceId,
+          sessionId: traceInfo.sessionId,
+          messageId: update.messageId,
+          seq: traceInfo.seq,
+          model: traceInfo.model,
+          source: traceInfo.source,
+          contentLength: traceInfo.contentLength,
+          chunkLength: traceInfo.chunkLength,
+          remainLength: traceInfo.remainLength,
+        });
       }
     });
 
@@ -553,16 +758,10 @@ export const useChatStore = createPersistStore(
 
         get().updateStat(message, targetSession);
 
-        get().checkMcpJson(message);
-
         get().summarizeSession(false, targetSession);
       },
 
-      async onUserInput(
-        content: string,
-        attachImages?: string[],
-        isMcpResponse?: boolean,
-      ) {
+      async onUserInput(content: string, attachments?: ChatAttachment[]) {
         const session = get().currentSession();
 
         // 检查是否为多模型模式
@@ -570,34 +769,23 @@ export const useChatStore = createPersistStore(
           session.multiModelMode?.enabled &&
           session.multiModelMode.selectedModels.length > 1
         ) {
-          return get().onMultiModelUserInput(
-            content,
-            attachImages,
-            isMcpResponse,
-          );
+          return get().onMultiModelUserInput(content, attachments);
         }
 
         const modelConfig = session.mask.modelConfig;
 
-        // MCP Response no need to fill template
-        let mContent: string | MultimodalContent[] = isMcpResponse
-          ? content
-          : fillTemplateWith(content, modelConfig);
+        let mContent: string | MultimodalContent[] = fillTemplateWith(
+          content,
+          modelConfig,
+        );
 
-        if (!isMcpResponse && attachImages && attachImages.length > 0) {
-          mContent = [
-            ...(content ? [{ type: "text" as const, text: content }] : []),
-            ...attachImages.map((url) => ({
-              type: "image_url" as const,
-              image_url: { url },
-            })),
-          ];
+        if (attachments && attachments.length > 0) {
+          mContent = buildUserMessageContent(content, attachments);
         }
 
         let userMessage: ChatMessage = createMessage({
           role: "user",
           content: mContent,
-          isMcpResponse,
         });
 
         const botMessage: ChatMessage = createMessage({
@@ -624,20 +812,95 @@ export const useChatStore = createPersistStore(
         });
 
         const api: ClientApi = getClientApi(modelConfig.providerName);
+        const nativeTools = await getEnabledMcpNativeTools(
+          modelConfig.model,
+          useAppConfig.getState().mcpEnabled ?? false,
+          useAppConfig.getState().mcpEnabledClients,
+          useAppConfig.getState().mcpDisabledTools,
+          resolveNativeToolProvider(modelConfig.providerName),
+        );
 
         // make request
         api.llm.chat({
           messages: sendMessages,
           config: { ...modelConfig, stream: true },
+          trace: {
+            traceId: createStreamTraceId(session.id, botMessage.id),
+            sessionId: session.id,
+            messageId: botMessage.id,
+            model: modelConfig.model,
+            source: "single-model",
+          },
+          nativeTools,
           onUpdate(message) {
             botMessage.streaming = true;
             if (message) {
+              const traceId = createStreamTraceId(session.id, botMessage.id);
+              const traceMeta = getLatestMessageTrace(botMessage.id);
+              if (traceMeta) {
+                recordStreamTraceStage("store_onUpdate", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: botMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "single-model",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+                recordStreamTraceStage("segment_update_start", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: botMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "single-model",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+              }
               botMessage.content = message;
+              botMessage.segments = updateMessageSegmentsFromStream(
+                botMessage.segments,
+                message,
+                botMessage.statistic?.reasoningLatency,
+              );
+              if (traceMeta) {
+                recordStreamTraceStage("segment_update_done", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: botMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "single-model",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+              }
               // 使用流式优化器进行批量更新，减少存储频率
               streamOptimizer.updateStreamingMessage(
                 session.id,
                 botMessage.id,
-                message,
+                {
+                  content: message,
+                  streaming: true,
+                  segments: cloneMessageSegments(botMessage.segments),
+                  _trace: traceMeta
+                    ? {
+                        traceId,
+                        seq: traceMeta.seq,
+                        model: modelConfig.model,
+                        source: "single-model",
+                        sessionId: session.id,
+                        contentLength: traceMeta.contentLength,
+                        chunkLength: traceMeta.chunkLength,
+                        remainLength: traceMeta.remainLength,
+                      }
+                    : undefined,
+                },
                 session,
               );
             }
@@ -655,9 +918,18 @@ export const useChatStore = createPersistStore(
                 const finalBotMessage = {
                   ...session.messages[messageIndex],
                   streaming: false,
-                  content: message,
                   date: new Date().toLocaleString(),
                 };
+
+                applyAssistantStatistics(finalBotMessage, message);
+                finalBotMessage.segments = resolveFinalMessageSegments(
+                  finalBotMessage.segments,
+                  message,
+                  finalBotMessage.statistic?.reasoningLatency,
+                );
+                finalBotMessage.content = serializeSegmentsToMessageContent(
+                  finalBotMessage.segments,
+                );
 
                 session.messages[messageIndex] = finalBotMessage;
                 get().onNewMessage(finalBotMessage, session);
@@ -667,26 +939,96 @@ export const useChatStore = createPersistStore(
             ChatControllerPool.remove(session.id, botMessage.id);
           },
           onBeforeTool(tool: ChatMessageTool) {
-            (botMessage.tools = botMessage?.tools || []).push(tool);
+            streamOptimizer.flushUpdates();
+            const enrichedTool = enrichToolWithMetadata(
+              tool,
+              nativeTools.metadata,
+            );
+            botMessage.tools = upsertToolInMessage(
+              botMessage.tools,
+              enrichedTool,
+            );
+            get().updateTargetSession(session, (session) => {
+              const currentMessage = session.messages.find(
+                (m) => m.id === botMessage.id,
+              );
+              if (!currentMessage) return;
+              currentMessage.tools = upsertToolInMessage(
+                currentMessage.tools,
+                enrichedTool,
+              );
+            });
             // 工具调用时也使用优化更新
             streamOptimizer.updateStreamingMessage(
               session.id,
               botMessage.id,
-              getMessageTextContent(botMessage),
+              {
+                content: botMessage.content,
+                tools: botMessage.tools,
+                segments: cloneMessageSegments(botMessage.segments),
+              },
               session,
             );
           },
+          onToolCallMessage(toolCallMessage) {
+            streamOptimizer.flushUpdates();
+            botMessage.toolCallContent = toolCallMessage.content || "";
+            botMessage.segments = appendToolRoundSegments(
+              botMessage.segments,
+              toolCallMessage.content || "",
+              toolCallMessage.tool_calls?.map((tool) => tool.id) ?? [],
+              botMessage.statistic?.reasoningLatency,
+            );
+            get().updateTargetSession(session, (session) => {
+              const currentMessage = session.messages.find(
+                (m) => m.id === botMessage.id,
+              );
+              if (!currentMessage) return;
+              currentMessage.toolCallContent = toolCallMessage.content || "";
+              currentMessage.segments = cloneMessageSegments(
+                botMessage.segments,
+              );
+              currentMessage.content = serializeSegmentsToMessageContent(
+                currentMessage.segments,
+              );
+            });
+          },
           onAfterTool(tool: ChatMessageTool) {
+            streamOptimizer.flushUpdates();
             botMessage?.tools?.forEach((t, i, tools) => {
               if (tool.id == t.id) {
-                tools[i] = { ...tool };
+                tools[i] = {
+                  ...tools[i],
+                  ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                  response: tool.response,
+                  content:
+                    tool.content ??
+                    (tool.response ? stringifyToolResult(tool.response) : ""),
+                };
               }
+            });
+            get().updateTargetSession(session, (session) => {
+              const currentMessage = session.messages.find(
+                (m) => m.id === botMessage.id,
+              );
+              if (!currentMessage) return;
+              currentMessage.tools = upsertToolInMessage(currentMessage.tools, {
+                ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                response: tool.response,
+                content:
+                  tool.content ??
+                  (tool.response ? stringifyToolResult(tool.response) : ""),
+              });
             });
             // 工具完成时使用优化更新
             streamOptimizer.updateStreamingMessage(
               session.id,
               botMessage.id,
-              getMessageTextContent(botMessage),
+              {
+                content: botMessage.content,
+                tools: botMessage.tools,
+                segments: cloneMessageSegments(botMessage.segments),
+              },
               session,
             );
           },
@@ -722,32 +1064,25 @@ export const useChatStore = createPersistStore(
 
       async onMultiModelUserInput(
         content: string,
-        attachImages?: string[],
-        isMcpResponse?: boolean,
+        attachments?: ChatAttachment[],
       ) {
         const session = get().currentSession();
         const multiModelMode = session.multiModelMode!;
 
         // 准备用户消息内容
-        let mContent: string | MultimodalContent[] = isMcpResponse
-          ? content
-          : fillTemplateWith(content, session.mask.modelConfig);
+        let mContent: string | MultimodalContent[] = fillTemplateWith(
+          content,
+          session.mask.modelConfig,
+        );
 
-        if (!isMcpResponse && attachImages && attachImages.length > 0) {
-          mContent = [
-            ...(content ? [{ type: "text" as const, text: content }] : []),
-            ...attachImages.map((url) => ({
-              type: "image_url" as const,
-              image_url: { url },
-            })),
-          ];
+        if (attachments && attachments.length > 0) {
+          mContent = buildUserMessageContent(content, attachments);
         }
 
         // 创建用户消息
         const userMessage: ChatMessage = createMessage({
           role: "user",
           content: mContent,
-          isMcpResponse,
           isMultiModel: true,
         });
 
@@ -805,19 +1140,94 @@ export const useChatStore = createPersistStore(
           multiModelMode.modelMessages[modelKey] = recentMessages;
 
           const api: ClientApi = getClientApi(modelConfig.providerName);
+          const nativeTools = await getEnabledMcpNativeTools(
+            modelConfig.model,
+            useAppConfig.getState().mcpEnabled ?? false,
+            useAppConfig.getState().mcpEnabledClients,
+            useAppConfig.getState().mcpDisabledTools,
+            resolveNativeToolProvider(modelConfig.providerName),
+          );
 
           return api.llm.chat({
             messages: recentMessages,
             config: { ...modelConfig, stream: true },
+            trace: {
+              traceId: createStreamTraceId(session.id, botMessage.id),
+              sessionId: session.id,
+              messageId: botMessage.id,
+              model: modelConfig.model,
+              source: "multi-model",
+            },
+            nativeTools,
             onUpdate(message) {
               botMessage.streaming = true;
               if (message) {
+                const traceId = createStreamTraceId(session.id, botMessage.id);
+                const traceMeta = getLatestMessageTrace(botMessage.id);
+                if (traceMeta) {
+                  recordStreamTraceStage("store_onUpdate", {
+                    traceId,
+                    sessionId: session.id,
+                    messageId: botMessage.id,
+                    seq: traceMeta.seq,
+                    model: modelConfig.model,
+                    source: "multi-model",
+                    contentLength: traceMeta.contentLength,
+                    chunkLength: traceMeta.chunkLength,
+                    remainLength: traceMeta.remainLength,
+                  });
+                  recordStreamTraceStage("segment_update_start", {
+                    traceId,
+                    sessionId: session.id,
+                    messageId: botMessage.id,
+                    seq: traceMeta.seq,
+                    model: modelConfig.model,
+                    source: "multi-model",
+                    contentLength: traceMeta.contentLength,
+                    chunkLength: traceMeta.chunkLength,
+                    remainLength: traceMeta.remainLength,
+                  });
+                }
                 botMessage.content = message;
+                botMessage.segments = updateMessageSegmentsFromStream(
+                  botMessage.segments,
+                  message,
+                  botMessage.statistic?.reasoningLatency,
+                );
+                if (traceMeta) {
+                  recordStreamTraceStage("segment_update_done", {
+                    traceId,
+                    sessionId: session.id,
+                    messageId: botMessage.id,
+                    seq: traceMeta.seq,
+                    model: modelConfig.model,
+                    source: "multi-model",
+                    contentLength: traceMeta.contentLength,
+                    chunkLength: traceMeta.chunkLength,
+                    remainLength: traceMeta.remainLength,
+                  });
+                }
                 // 多模型模式也使用流式优化器
                 streamOptimizer.updateStreamingMessage(
                   session.id,
                   botMessage.id,
-                  message,
+                  {
+                    content: message,
+                    streaming: true,
+                    segments: cloneMessageSegments(botMessage.segments),
+                    _trace: traceMeta
+                      ? {
+                          traceId,
+                          seq: traceMeta.seq,
+                          model: modelConfig.model,
+                          source: "multi-model",
+                          sessionId: session.id,
+                          contentLength: traceMeta.contentLength,
+                          chunkLength: traceMeta.chunkLength,
+                          remainLength: traceMeta.remainLength,
+                        }
+                      : undefined,
+                  },
                   session,
                 );
               }
@@ -828,8 +1238,16 @@ export const useChatStore = createPersistStore(
 
               botMessage.streaming = false;
               if (message) {
-                botMessage.content = message;
                 botMessage.date = new Date().toLocaleString();
+                applyAssistantStatistics(botMessage, message);
+                botMessage.segments = resolveFinalMessageSegments(
+                  botMessage.segments,
+                  message,
+                  botMessage.statistic?.reasoningLatency,
+                );
+                botMessage.content = serializeSegmentsToMessageContent(
+                  botMessage.segments,
+                );
 
                 // 更新该模型的独立消息历史
                 multiModelMode.modelMessages[modelKey].push(botMessage);
@@ -839,12 +1257,98 @@ export const useChatStore = createPersistStore(
               ChatControllerPool.remove(session.id, botMessage.id);
             },
             onBeforeTool(tool: ChatMessageTool) {
-              (botMessage.tools = botMessage?.tools || []).push(tool);
+              streamOptimizer.flushUpdates();
+              const enrichedTool = enrichToolWithMetadata(
+                tool,
+                nativeTools.metadata,
+              );
+              botMessage.tools = upsertToolInMessage(
+                botMessage.tools,
+                enrichedTool,
+              );
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages.find(
+                  (m) => m.id === botMessage.id,
+                );
+                if (!currentMessage) return;
+                currentMessage.tools = upsertToolInMessage(
+                  currentMessage.tools,
+                  enrichedTool,
+                );
+              });
               // 多模型工具调用也使用优化更新
               streamOptimizer.updateStreamingMessage(
                 session.id,
                 botMessage.id,
-                getMessageTextContent(botMessage),
+                {
+                  content: botMessage.content,
+                  tools: botMessage.tools,
+                  segments: cloneMessageSegments(botMessage.segments),
+                },
+                session,
+              );
+            },
+            onToolCallMessage(toolCallMessage) {
+              streamOptimizer.flushUpdates();
+              botMessage.toolCallContent = toolCallMessage.content || "";
+              botMessage.segments = appendToolRoundSegments(
+                botMessage.segments,
+                toolCallMessage.content || "",
+                toolCallMessage.tool_calls?.map((tool) => tool.id) ?? [],
+                botMessage.statistic?.reasoningLatency,
+              );
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages.find(
+                  (m) => m.id === botMessage.id,
+                );
+                if (!currentMessage) return;
+                currentMessage.toolCallContent = toolCallMessage.content || "";
+                currentMessage.segments = cloneMessageSegments(
+                  botMessage.segments,
+                );
+                currentMessage.content = serializeSegmentsToMessageContent(
+                  currentMessage.segments,
+                );
+              });
+            },
+            onAfterTool(tool: ChatMessageTool) {
+              streamOptimizer.flushUpdates();
+              botMessage?.tools?.forEach((t, i, tools) => {
+                if (tool.id == t.id) {
+                  tools[i] = {
+                    ...tools[i],
+                    ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                    response: tool.response,
+                    content:
+                      tool.content ??
+                      (tool.response ? stringifyToolResult(tool.response) : ""),
+                  };
+                }
+              });
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages.find(
+                  (m) => m.id === botMessage.id,
+                );
+                if (!currentMessage) return;
+                currentMessage.tools = upsertToolInMessage(
+                  currentMessage.tools,
+                  {
+                    ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                    response: tool.response,
+                    content:
+                      tool.content ??
+                      (tool.response ? stringifyToolResult(tool.response) : ""),
+                  },
+                );
+              });
+              streamOptimizer.updateStreamingMessage(
+                session.id,
+                botMessage.id,
+                {
+                  content: botMessage.content,
+                  tools: botMessage.tools,
+                  segments: cloneMessageSegments(botMessage.segments),
+                },
                 session,
               );
             },
@@ -883,33 +1387,7 @@ export const useChatStore = createPersistStore(
 
         // in-context prompts
         const contextPrompts = session.mask.context.slice();
-
-        const mcpSystemPrompt = await getMcpSystemPrompt(
-          session.mcpEnabled ?? false,
-          session.mcpEnabledClients,
-        );
-
-        var systemPrompts: ChatMessage[] = [];
-
-        if (mcpSystemPrompt) {
-          // 只在 mcpSystemPrompt 不為空時才創建 system message
-          systemPrompts = [
-            createMessage({
-              role: "system",
-              content: mcpSystemPrompt,
-            }),
-          ];
-        }
-        // 如果兩者都沒有，systemPrompts 保持為空數組
-
-        if (mcpSystemPrompt) {
-          if (process.env.NODE_ENV === "development") {
-            console.log(
-              "[Global System Prompt] ",
-              systemPrompts.at(0)?.content ?? "empty",
-            );
-          }
-        }
+        const systemPrompts: ChatMessage[] = [];
         const memoryPrompt = get().getMemoryPrompt();
         // long term memory
         const shouldSendLongTermMemory =
@@ -987,7 +1465,7 @@ export const useChatStore = createPersistStore(
           ...reversedRecentMessages.reverse(),
         ];
 
-        return recentMessages;
+        return expandMessagesWithToolHistory(recentMessages);
       },
 
       updateMessage(
@@ -1030,12 +1508,13 @@ export const useChatStore = createPersistStore(
           model = compressDecision.model;
           providerName = compressDecision.providerName;
         } else {
-          // 即使没有设置摘要模型，也要确保使用全局配置
+          // 如果没有明确的摘要模型，兜底使用当前对话模型
           const sessionCompressConfig = getSessionCompressModelConfig(
             session.mask,
           );
-          model = sessionCompressConfig.model;
-          providerName = sessionCompressConfig.providerName;
+          model = sessionCompressConfig.model || modelConfig.model;
+          providerName =
+            sessionCompressConfig.providerName || modelConfig.providerName;
         }
 
         const api: ClientApi = getClientApi(providerName as ServiceProvider);
@@ -1045,10 +1524,15 @@ export const useChatStore = createPersistStore(
 
         // should summarize topic after chating more than 50 words
         const SUMMARIZE_MIN_LEN = 50;
+        const isFirstTopicGeneration =
+          config.enableAutoGenerateTitle &&
+          session.topic === DEFAULT_TOPIC &&
+          messages.filter((msg) => !msg.isError).length >= 2;
         if (
           (config.enableAutoGenerateTitle &&
             session.topic === DEFAULT_TOPIC &&
-            countMessages(messages) >= SUMMARIZE_MIN_LEN) ||
+            (countMessages(messages) >= SUMMARIZE_MIN_LEN ||
+              isFirstTopicGeneration)) ||
           refreshTitle
         ) {
           const startIndex = Math.max(
@@ -1074,12 +1558,15 @@ export const useChatStore = createPersistStore(
               providerName,
             },
             onFinish(message, responseRes) {
+              const replyContent = getResponseContentWithoutThinking(message);
               if (responseRes?.status === 200) {
                 get().updateTargetSession(
                   session,
                   (session) =>
                     (session.topic =
-                      message.length > 0 ? trimTopic(message) : DEFAULT_TOPIC),
+                      replyContent.length > 0
+                        ? trimTopic(replyContent)
+                        : DEFAULT_TOPIC),
                 );
               }
             },
@@ -1135,13 +1622,15 @@ export const useChatStore = createPersistStore(
               providerName,
             },
             onUpdate(message) {
-              session.memoryPrompt = message;
+              session.memoryPrompt =
+                getMessageTextContentWithoutThinkingFromContent(message);
             },
             onFinish(message, responseRes) {
               if (responseRes?.status === 200) {
                 get().updateTargetSession(session, (session) => {
                   session.lastSummarizeIndex = lastSummarizeIndex;
-                  session.memoryPrompt = message; // Update the memory prompt for stored it in local storage
+                  session.memoryPrompt =
+                    getResponseContentWithoutThinking(message); // Update the memory prompt for stored it in local storage
                 });
               }
             },
@@ -1191,6 +1680,8 @@ export const useChatStore = createPersistStore(
           return;
         }
 
+        const retryMessage = session.messages[messageIndex];
+
         // 保存当前版本到版本数组
         get().updateTargetSession(session, (session) => {
           const currentMessage = session.messages[messageIndex];
@@ -1212,6 +1703,10 @@ export const useChatStore = createPersistStore(
           // 重置消息状态，准备接收新回复
           currentMessage.content = "";
           currentMessage.streaming = true;
+          currentMessage.tools = [];
+          currentMessage.toolCallContent = "";
+          currentMessage.segments = [];
+          currentMessage.statistic = undefined;
           currentMessage.date = new Date().toLocaleString();
           // 更新消息的模型字段为当前会话的模型配置
           currentMessage.model = session.mask.modelConfig.model;
@@ -1225,27 +1720,101 @@ export const useChatStore = createPersistStore(
 
         const modelConfig = session.mask.modelConfig;
         const api: ClientApi = getClientApi(modelConfig.providerName);
+        const nativeTools = await getEnabledMcpNativeTools(
+          modelConfig.model,
+          useAppConfig.getState().mcpEnabled ?? false,
+          useAppConfig.getState().mcpEnabledClients,
+          useAppConfig.getState().mcpDisabledTools,
+          resolveNativeToolProvider(modelConfig.providerName),
+        );
 
         // 发送请求
         try {
           await api.llm.chat({
             messages: sendMessages,
             config: { ...modelConfig, stream: true },
+            trace: {
+              traceId: createStreamTraceId(session.id, botMessageId),
+              sessionId: session.id,
+              messageId: botMessageId,
+              model: modelConfig.model,
+              source: "retry",
+            },
+            nativeTools,
             onUpdate(message) {
-              get().updateTargetSession(session, (session) => {
-                const currentMessage = session.messages[messageIndex];
-                if (currentMessage) {
-                  currentMessage.streaming = true;
-                  currentMessage.content = message;
-                  // 重试时也使用流式优化器
-                  streamOptimizer.updateStreamingMessage(
-                    session.id,
-                    currentMessage.id,
-                    message,
-                    session,
-                  );
-                }
-              });
+              if (!message) return;
+
+              const traceId = createStreamTraceId(session.id, retryMessage.id);
+              const traceMeta = getLatestMessageTrace(retryMessage.id);
+              if (traceMeta) {
+                recordStreamTraceStage("store_onUpdate", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: retryMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "retry",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+                recordStreamTraceStage("segment_update_start", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: retryMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "retry",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+              }
+
+              retryMessage.streaming = true;
+              retryMessage.content = message;
+              retryMessage.segments = updateMessageSegmentsFromStream(
+                retryMessage.segments,
+                message,
+                retryMessage.statistic?.reasoningLatency,
+              );
+
+              if (traceMeta) {
+                recordStreamTraceStage("segment_update_done", {
+                  traceId,
+                  sessionId: session.id,
+                  messageId: retryMessage.id,
+                  seq: traceMeta.seq,
+                  model: modelConfig.model,
+                  source: "retry",
+                  contentLength: traceMeta.contentLength,
+                  chunkLength: traceMeta.chunkLength,
+                  remainLength: traceMeta.remainLength,
+                });
+              }
+
+              streamOptimizer.updateStreamingMessage(
+                session.id,
+                retryMessage.id,
+                {
+                  content: message,
+                  streaming: true,
+                  segments: cloneMessageSegments(retryMessage.segments),
+                  _trace: traceMeta
+                    ? {
+                        traceId,
+                        seq: traceMeta.seq,
+                        model: modelConfig.model,
+                        source: "retry",
+                        sessionId: session.id,
+                        contentLength: traceMeta.contentLength,
+                        chunkLength: traceMeta.chunkLength,
+                        remainLength: traceMeta.remainLength,
+                      }
+                    : undefined,
+                },
+                session,
+              );
             },
             onFinish(message) {
               // 立即刷新待处理的更新
@@ -1256,13 +1825,111 @@ export const useChatStore = createPersistStore(
                 const currentMessage = session.messages[messageIndex];
                 if (currentMessage) {
                   currentMessage.streaming = false;
-                  currentMessage.content = message;
+                  applyAssistantStatistics(currentMessage, message);
+                  currentMessage.segments = resolveFinalMessageSegments(
+                    currentMessage.segments,
+                    message,
+                    currentMessage.statistic?.reasoningLatency,
+                  );
+                  currentMessage.content = serializeSegmentsToMessageContent(
+                    currentMessage.segments,
+                  );
                   finishedMessage = currentMessage;
                 }
               });
               if (finishedMessage) {
                 get().onNewMessage(finishedMessage, session);
               }
+              ChatControllerPool.remove(session.id, botMessageId);
+            },
+            onBeforeTool(tool: ChatMessageTool) {
+              streamOptimizer.flushUpdates();
+              const enrichedTool = enrichToolWithMetadata(
+                tool,
+                nativeTools.metadata,
+              );
+              retryMessage.tools = upsertToolInMessage(
+                retryMessage.tools,
+                enrichedTool,
+              );
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages[messageIndex];
+                if (!currentMessage) return;
+                currentMessage.tools = upsertToolInMessage(
+                  currentMessage.tools,
+                  enrichedTool,
+                );
+              });
+              streamOptimizer.updateStreamingMessage(
+                session.id,
+                retryMessage.id,
+                {
+                  content: retryMessage.content,
+                  tools: retryMessage.tools,
+                  segments: cloneMessageSegments(retryMessage.segments),
+                },
+                session,
+              );
+            },
+            onToolCallMessage(toolCallMessage) {
+              streamOptimizer.flushUpdates();
+              retryMessage.toolCallContent = toolCallMessage.content || "";
+              retryMessage.segments = appendToolRoundSegments(
+                retryMessage.segments,
+                toolCallMessage.content || "",
+                toolCallMessage.tool_calls?.map((tool) => tool.id) ?? [],
+                retryMessage.statistic?.reasoningLatency,
+              );
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages[messageIndex];
+                if (!currentMessage) return;
+                currentMessage.toolCallContent = retryMessage.toolCallContent;
+                currentMessage.segments = cloneMessageSegments(
+                  retryMessage.segments,
+                );
+                currentMessage.content = serializeSegmentsToMessageContent(
+                  currentMessage.segments,
+                );
+              });
+            },
+            onAfterTool(tool: ChatMessageTool) {
+              streamOptimizer.flushUpdates();
+              retryMessage?.tools?.forEach((t, i, tools) => {
+                if (tool.id === t.id) {
+                  tools[i] = {
+                    ...tools[i],
+                    ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                    response: tool.response,
+                    content:
+                      tool.content ??
+                      (tool.response ? stringifyToolResult(tool.response) : ""),
+                  };
+                }
+              });
+              get().updateTargetSession(session, (session) => {
+                const currentMessage = session.messages[messageIndex];
+                if (!currentMessage?.tools) return;
+                currentMessage.tools = upsertToolInMessage(
+                  currentMessage.tools,
+                  {
+                    ...enrichToolWithMetadata(tool, nativeTools.metadata),
+                    response: tool.response,
+                    content:
+                      tool.content ??
+                      (tool.response ? stringifyToolResult(tool.response) : ""),
+                  },
+                );
+              });
+              streamOptimizer.updateStreamingMessage(
+                session.id,
+                retryMessage.id,
+                {
+                  content: retryMessage.content,
+                  tools: retryMessage.tools,
+                  segments: cloneMessageSegments(retryMessage.segments),
+                },
+                session,
+              );
             },
             onError(error) {
               const isAborted = error.message.includes("aborted");
@@ -1300,70 +1967,72 @@ export const useChatStore = createPersistStore(
         }
       },
 
-      /** check if the message contains MCP JSON and execute the MCP action */
-      checkMcpJson(message: ChatMessage) {
-        const content = getMessageTextContent(message);
-        if (isMcpJson(content)) {
-          try {
-            const mcpRequest = extractMcpJson(content);
-            if (mcpRequest) {
-              executeMcpAction(mcpRequest.clientId, mcpRequest.mcp)
-                .then((result: any) => {
-                  const mcpResponse =
-                    typeof result === "object"
-                      ? JSON.stringify(result)
-                      : String(result);
-                  get().onUserInput(
-                    `\`\`\`json:mcp-response:${mcpRequest.clientId}\n${mcpResponse}\n\`\`\``,
-                    [],
-                    true,
-                  );
-                })
-                .catch((error: any) =>
-                  showToast("MCP execution failed", error),
-                );
-            }
-          } catch (error) {
-            // MCP JSON 检查失败，静默处理
-          }
-        }
-      },
-
       /** 更新当前对话的 MCP 客户端启用状态 */
       updateSessionMcpClient(clientId: string, enabled: boolean) {
-        const session = get().currentSession();
-        get().updateTargetSession(session, (session) => {
-          if (!session.mcpEnabledClients) {
-            session.mcpEnabledClients = {};
-          }
-          session.mcpEnabledClients[clientId] = enabled;
-        });
+        useAppConfig.setState((state) => ({
+          ...state,
+          mcpEnabledClients: {
+            ...(state.mcpEnabledClients ?? {}),
+            [clientId]: enabled,
+          },
+        }));
       },
 
       /** 获取当前对话的 MCP 客户端启用状态 */
       getSessionMcpClientStatus(clientId: string): boolean {
-        const session = get().currentSession();
-        return session.mcpEnabledClients?.[clientId] ?? true; // 默认启用
+        return useAppConfig.getState().mcpEnabledClients?.[clientId] ?? true;
       },
 
       /** 获取当前对话中所有 MCP 客户端的启用状态 */
       getSessionMcpClients(): Record<string, boolean> {
-        const session = get().currentSession();
-        return session.mcpEnabledClients ?? {};
+        return useAppConfig.getState().mcpEnabledClients ?? {};
+      },
+
+      /** 更新指定 MCP 客户端下某个工具的启用状态 */
+      updateSessionMcpTool(
+        clientId: string,
+        toolName: string,
+        enabled: boolean,
+      ) {
+        useAppConfig.setState((state) => {
+          const disabledToolsByClient = { ...(state.mcpDisabledTools ?? {}) };
+          const disabledTools = new Set(disabledToolsByClient[clientId] ?? []);
+
+          if (enabled) {
+            disabledTools.delete(toolName);
+          } else {
+            disabledTools.add(toolName);
+          }
+
+          if (disabledTools.size === 0) {
+            delete disabledToolsByClient[clientId];
+          } else {
+            disabledToolsByClient[clientId] = Array.from(disabledTools);
+          }
+
+          return {
+            ...state,
+            mcpDisabledTools: disabledToolsByClient,
+          };
+        });
+      },
+
+      /** 获取指定 MCP 客户端下被关闭的工具名列表 */
+      getSessionMcpDisabledTools(clientId: string): string[] {
+        return useAppConfig.getState().mcpDisabledTools?.[clientId] ?? [];
       },
 
       /** 更新当前对话的 MCP 功能总开关 */
       updateSessionMcpEnabled(enabled: boolean) {
-        const session = get().currentSession();
-        get().updateTargetSession(session, (session) => {
-          session.mcpEnabled = enabled;
-        });
+        useAppConfig.setState((state) => ({
+          ...state,
+          mcpEnabled: enabled,
+        }));
       },
 
       /** 获取当前对话的 MCP 功能总开关状态 */
       getSessionMcpEnabled(): boolean {
-        const session = get().currentSession();
-        return session.mcpEnabled ?? false; // 默认关闭
+        return useAppConfig.getState().mcpEnabled ?? false;
       },
 
       /** 清理资源 */

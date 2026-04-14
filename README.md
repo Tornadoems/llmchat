@@ -1,12 +1,9 @@
-# QADChat v2.17.5
+# LLMChat v2.17.6
 
-**QADChat 为基于项目 [NextChat](https://github.com/ChatGPTNextWeb/NextChat) 的改造版本, 由 v2.16.0 版本 clone 后进行二次开发**
+**LLMChat 为基于项目 [NextChat](https://github.com/ChatGPTNextWeb/NextChat) 的改造版本, 由 v2.16.0 版本 clone 后进行二次开发**
 
 **包含部分 UI 重构，使用逻辑重构，无用模块移除、全新功能模块**
 
-## 补充说明
-
-由于原Github账号不明原因被封禁，故使用新仓库进行存储，本仓库为 QADChat 新的官方仓库，谢谢🙏
 
 ## 开始使用
 
@@ -16,55 +13,33 @@
 
 支持通过环境变量配置所有主要AI服务商的API密钥和Base URL，并配置访问码，请参考 [.env.example](.env.example) 文件。
 
+#### 分组访问配置
+
+当前版本支持通过独立配置文件为不同访问密码提供不同的服务分组，推荐在 Docker 持久化目录中维护 `access-groups.json`。
+
+- 配置文件优先于旧 `ACCESS_CODE` 逻辑
+- 用户输入访问密码后，会自动加载该分组的默认模型、可用模型列表与 MCP 服务
+- 实际 API Key 与 Base URL 仍由服务端代理转发，不需要用户在浏览器里直接请求上游端点
+- 当配置文件不存在或未命中分组密码时，系统会自动回退到旧环境变量模式
+- 开发环境下如果 `/app/data/access-groups.json` 不存在，会自动回退读取仓库内 `./data/access-groups.json`
+
+可参考示例文件 [data/access-groups.example.json](data/access-groups.example.json)。
+
 #### Docker 部署(推荐)
 
-1. git clone https://github.com/MoonWeSif/qadchat.git
-2. cd qadchat
+1. git clone https://github.com/Tornadoems/llmchat.git
+2. cd llmchat
+3. 将 `data/access-groups.example.json` 复制为 `data/access-groups.json` 并填入你的分组配置，或继续使用旧环境变量方式
 3. docker-compose up -d
 
-#### Vercel 一键部署(推荐)
 
-点击[https://vercel.com/new/clone?repository-url=https://github.com/MoonWeSif/qadchat](https://vercel.com/new/clone?repository-url=https://github.com/MoonWeSif/qadchat)
-
-### Demo站点
-
-点击[https://qaduck.com](https://qaduck.com)
-
-## QADChat 版本特点
+## LLMChat 版本特点
 
 ### 架构重构
 
 - 将话题与助手(原名为“面具”)绑定，每个助手下的都拥有独立的话题列表，通过切换不同的助手，可以在该助手下快速创建话题。
   即原先整体架构为，话题-消息。该版本重构为助手-话题-消息。
   此重构有助于区分不同助手下的话题，避免所有话题均无条件展示，不便于浏览。同时增强了系统对于助手的依赖程度，能够更有效的利用助手提高效率。
-
-### 用户体验升级
-
-- 全局设置界面重构，清晰的设置分组，快速定位所需配置
-
-![全局设置界面重构](docs/images/readme/settings-ui-refactor.png)
-
-- 模型服务重构与模型管理界面重构
-
-  ![模型服务重构](docs/images/readme/model-service-refactor.png)
-
-  ![模型管理界面](docs/images/readme/model-management-ui.png)
-
-- 一键快速启停 MCP Server
-
-  ![MCP Server 管理](docs/images/readme/mcp-server-management.png)
-
-- 模型选择器 UI 与逻辑重构
-
-  ![模型选择器重构](docs/images/readme/model-selector-refactor.png)
-
-- 助手选择界面重构
-
-  ![助手选择界面重构](docs/images/readme/assistant-selector-refactor.png)
-
-- 内置模型添加上下文窗口，实现 Token 计数器模块
-
-  ![Token 计数器](docs/images/readme/token-calculate.png)
 
 - 新增侧边栏折叠按钮，支持完全隐藏/显示侧边栏
 - 可配置的模型能力（视觉、联网、嵌入、工具、思考），通过小图标进行显示，快速浏览模型功能
@@ -119,10 +94,6 @@
 - [x] 环境变量支持 ✅ **已完成**
 - [x] 模型/对话上下文统计 ✅ **已完成**
 - [ ] OpenAI Response 接口支持
-
-### Support
-
-请通过 [Issue](https://github.com/MoonWeSif/qadchat/issues) 来获取支持
 
 ## 致谢
 

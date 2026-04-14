@@ -20,6 +20,11 @@ import { MoonshotApi } from "./platforms/moonshot";
 import { DeepSeekApi } from "./platforms/deepseek";
 import { XAIApi } from "./platforms/xai";
 import { SiliconflowApi } from "./platforms/siliconflow";
+import type {
+  NativeToolDefinition,
+  NativeToolProvider,
+} from "../mcp/native-tools";
+import type { StreamTraceStartInfo } from "../utils/stream-trace";
 
 export const ROLES = ["system", "user", "assistant"] as const;
 export type MessageRole = (typeof ROLES)[number];
@@ -34,6 +39,15 @@ export interface MultimodalContent {
   image_url?: {
     url: string;
   };
+}
+
+export interface ChatAttachment {
+  id: string;
+  type: "image" | "text";
+  name: string;
+  mimeType: string;
+  data: string;
+  previewUrl?: string;
 }
 
 export interface MultimodalContentForAlibaba {
@@ -68,16 +82,44 @@ export interface SpeechOptions {
   onController?: (controller: AbortController) => void;
 }
 
+export interface RichMessage {
+  content: string;
+  displayContent?: string;
+  reasoning_content?: string;
+  is_stream_request?: boolean;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    first_content_latency?: number;
+    thinking_time?: number;
+    searching_time?: number;
+    total_latency?: number;
+  };
+}
+
 export interface ChatOptions {
   messages: RequestMessage[];
   config: LLMConfig;
+  trace?: StreamTraceStartInfo;
+  nativeTools?: {
+    provider: NativeToolProvider;
+    tools: any[];
+    funcs: Record<string, Function>;
+    metadata: Record<string, NativeToolDefinition>;
+  };
 
   onUpdate?: (message: string, chunk: string) => void;
-  onFinish: (message: string, responseRes: Response) => void;
+  onFinish: (message: string | RichMessage, responseRes: Response) => void;
   onError?: (err: Error) => void;
   onController?: (controller: AbortController) => void;
   onBeforeTool?: (tool: ChatMessageTool) => void;
   onAfterTool?: (tool: ChatMessageTool) => void;
+  onToolCallMessage?: (message: {
+    role: "assistant";
+    content: string;
+    tool_calls: ChatMessageTool[];
+  }) => void;
 }
 
 export interface LLMUsage {
@@ -178,7 +220,7 @@ export class ClientApi {
       .concat([
         {
           from: "human",
-          value: "Share from [QADChat]: https://github.com/MoonWeSif/qadchat",
+          value: "Share from [LLMChat]: https://github.com/Tornadoems/llmchat",
         },
       ]);
 
@@ -268,22 +310,22 @@ export function getHeaders(
       isCustomProvider && customProvider
         ? customProvider.apiKey
         : isGoogle
-          ? accessStore.googleApiKey
-          : isAnthropic
-            ? accessStore.anthropicApiKey
-            : isByteDance
-              ? accessStore.bytedanceApiKey
-              : isAlibaba
-                ? accessStore.alibabaApiKey
-                : isMoonshot
-                  ? accessStore.moonshotApiKey
-                  : isXAI
-                    ? accessStore.xaiApiKey
-                    : isDeepSeek
-                      ? accessStore.deepseekApiKey
-                      : isSiliconFlow
-                        ? accessStore.siliconflowApiKey
-                        : accessStore.openaiApiKey;
+        ? accessStore.googleApiKey
+        : isAnthropic
+        ? accessStore.anthropicApiKey
+        : isByteDance
+        ? accessStore.bytedanceApiKey
+        : isAlibaba
+        ? accessStore.alibabaApiKey
+        : isMoonshot
+        ? accessStore.moonshotApiKey
+        : isXAI
+        ? accessStore.xaiApiKey
+        : isDeepSeek
+        ? accessStore.deepseekApiKey
+        : isSiliconFlow
+        ? accessStore.siliconflowApiKey
+        : accessStore.openaiApiKey;
 
     return {
       isGoogle,
@@ -305,8 +347,8 @@ export function getHeaders(
     return isAnthropic
       ? "x-api-key"
       : isGoogle
-        ? "x-goog-api-key"
-        : "Authorization";
+      ? "x-goog-api-key"
+      : "Authorization";
   }
 
   const {
@@ -389,7 +431,13 @@ export function getClientApi(provider: ServiceProvider | string): ClientApi {
 }
 
 // 标准化provider名称，将provider.id转换为ServiceProvider枚举值
-export function normalizeProviderName(provider: string): ServiceProvider {
+export function normalizeProviderName(
+  provider?: string | null,
+): ServiceProvider {
+  if (!provider || typeof provider !== "string") {
+    return ServiceProvider.OpenAI;
+  }
+
   // 如果是自定义服务商，需要根据其类型返回对应的ServiceProvider
   if (provider.startsWith("custom_")) {
     const { useAccessStore } = require("../store");

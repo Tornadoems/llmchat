@@ -11,13 +11,17 @@
 # next.js
 /.next/
 /out/
+/.swc/
 
 # production
+/reference-project
 /build
+/.kilo
 
 # misc
 .DS_Store
 *.pem
+/.cache/
 
 # debug
 npm-debug.log*
@@ -49,6 +53,9 @@ masks.json
 
 # mcp config
 app/mcp/mcp_config.json
+
+# data
+data/access-groups.json
 
 .kiro
 dev_docs

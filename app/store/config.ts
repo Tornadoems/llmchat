@@ -59,7 +59,12 @@ export const DEFAULT_CONFIG = {
 
   disablePromptHint: false,
 
+  mcpEnabled: false,
+  mcpEnabledClients: {} as Record<string, boolean>,
+  mcpDisabledTools: {} as Record<string, string[]>,
+
   useModelIconAsAvatar: false, // use model icon as AI avatar instead of emoji
+  enableMultiModel: false,
 
   customModels: "",
   models: DEFAULT_MODELS as any as LLMModel[],
@@ -194,7 +199,7 @@ export const useAppConfig = createPersistStore(
   }),
   {
     name: StoreKey.Config,
-    version: 4.3,
+    version: 4.4,
 
     merge(persistedState, currentState) {
       const state = persistedState as ChatConfig | undefined;
@@ -245,7 +250,7 @@ export const useAppConfig = createPersistStore(
         state.modelConfig.template =
           state.modelConfig.template !== DEFAULT_INPUT_TEMPLATE
             ? state.modelConfig.template
-            : (config?.template ?? DEFAULT_INPUT_TEMPLATE);
+            : config?.template ?? DEFAULT_INPUT_TEMPLATE;
       }
 
       if (version < 4.1) {
@@ -263,6 +268,15 @@ export const useAppConfig = createPersistStore(
         // 根据当前模型更新压缩阈值
         state.modelConfig.compressMessageLengthThreshold =
           getModelCompressThreshold(state.modelConfig.model);
+      }
+
+      if (version < 4.4) {
+        state.mcpEnabled = DEFAULT_CONFIG.mcpEnabled;
+        state.mcpEnabledClients = DEFAULT_CONFIG.mcpEnabledClients;
+      }
+
+      if (typeof state.enableMultiModel !== "boolean") {
+        state.enableMultiModel = DEFAULT_CONFIG.enableMultiModel;
       }
 
       return state as any;

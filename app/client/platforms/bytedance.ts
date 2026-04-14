@@ -16,7 +16,7 @@ import {
   SpeechOptions,
 } from "../api";
 
-import { streamWithThink } from "@/app/utils/chat";
+import { streamWithThink, toOpenAICompatibleMessage } from "@/app/utils/chat";
 import { getClientConfig } from "@/app/config/client";
 import { preProcessImageContent } from "@/app/utils/chat";
 import {
@@ -24,6 +24,7 @@ import {
   getTimeoutMSByModel,
 } from "@/app/utils";
 import { fetch } from "@/app/utils/stream";
+import { collectOpenAIStyleToolCalls } from "@/app/utils/chat";
 
 export interface OpenAIListModelResponse {
   object: string;
@@ -90,16 +91,26 @@ export class DoubaoApi implements LLMApi {
         v.role === "assistant"
           ? getMessageTextContentWithoutThinking(v)
           : await preProcessImageContent(v.content);
-      messages.push({ role: v.role, content });
+      messages.push(
+        toOpenAICompatibleMessage(
+          {
+            ...v,
+            content,
+          },
+          { stripThinkingForAssistant: v.role === "assistant" },
+        ) as any,
+      );
     }
 
+    const sessionModelConfig = useChatStore.getState().currentSession()
+      .mask.modelConfig;
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
-      },
+      ...sessionModelConfig,
+      ...options.config,
+      model: options.config.model || sessionModelConfig.model,
+      providerName:
+        options.config.providerName || sessionModelConfig.providerName,
     };
 
     const shouldStream = !!options.config.stream;
@@ -135,8 +146,14 @@ export class DoubaoApi implements LLMApi {
       );
 
       if (shouldStream) {
-        const tools: any[] = [];
-        const funcs: Record<string, Function> = {};
+        const tools =
+          options.nativeTools?.provider === "openai"
+            ? options.nativeTools.tools
+            : [];
+        const funcs =
+          options.nativeTools?.provider === "openai"
+            ? options.nativeTools.funcs
+            : {};
         return streamWithThink(
           chatPath,
           requestPayload,
@@ -163,22 +180,7 @@ export class DoubaoApi implements LLMApi {
 
             const tool_calls = choices[0]?.delta?.tool_calls;
             if (tool_calls?.length > 0) {
-              const index = tool_calls[0]?.index;
-              const id = tool_calls[0]?.id;
-              const args = tool_calls[0]?.function?.arguments;
-              if (id) {
-                runTools.push({
-                  id,
-                  type: tool_calls[0]?.type,
-                  function: {
-                    name: tool_calls[0]?.function?.name as string,
-                    arguments: args,
-                  },
-                });
-              } else {
-                // @ts-ignore
-                runTools[index]["function"]["arguments"] += args;
-              }
+              collectOpenAIStyleToolCalls(runTools, tool_calls);
             }
             const reasoning = choices[0]?.delta?.reasoning_content;
             const content = choices[0]?.delta?.content;
@@ -217,10 +219,17 @@ export class DoubaoApi implements LLMApi {
             toolCallMessage: any,
             toolCallResult: any[],
           ) => {
+            // 从工具调用消息中移除思考内容，不发送给模型
+            const cleanedToolCallMessage = {
+              ...toolCallMessage,
+              content: (toolCallMessage.content || "")
+                .replace(/<think>[\s\S]*?<\/think>/g, "")
+                .trim(),
+            };
             requestPayload?.messages?.splice(
               requestPayload?.messages?.length,
               0,
-              toolCallMessage,
+              cleanedToolCallMessage,
               ...toolCallResult,
             );
           },

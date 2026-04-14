@@ -23,6 +23,18 @@ const tw = {
     SubTips: "或者輸入你的 OpenAI 或 Google API 金鑰",
     Input: "在此處填寫存取密碼",
     Confirm: "確認",
+    Verifying: "驗證中...",
+    Invalid: "存取密碼錯誤",
+    Brand: "LLMChat",
+    BrandSubTitle: "Build your own AI assistant.",
+    Description:
+      "這是一個受保護的工作台。完成存取碼驗證後，即可使用完整對話與設定能力。",
+    SecurityTitle: "安全入口",
+    SecurityBadge: "已啟用存取控制",
+    HintTitle: "解鎖內容",
+    HintFeatureChats: "完整聊天與歷史會話存取",
+    HintFeatureProviders: "模型、MCP 與工作區設定能力",
+    HintFeatureSecurity: "共享部署下的安全使用體驗",
     Later: "稍候再說",
     Return: "返回",
     SaasTips: "設定太麻煩，想要立即使用",
@@ -114,7 +126,7 @@ const tw = {
       Masks: "所有角色助手",
       Clear: "清除聊天",
       Settings: "對話設定",
-      UploadImage: "上傳圖片",
+      UploadAttachment: "上傳圖片或文件",
       Search: "搜尋功能",
       SearchOn: "搜尋已啟用",
       SearchOff: "搜尋已停用",
@@ -124,11 +136,18 @@ const tw = {
     MCP: {
       Title: "MCP 工具控制",
       Enable: "啟用 MCP 功能",
-      EnableDesc: "開啟後可使用 MCP 工具，關閉後不會發送任何 MCP 相關提示詞",
+      EnableDesc:
+        "開啟後可使用 MCP 工具，關閉後不會向模型注入任何 MCP 原生工具",
       NoTools: "暫無可用的 MCP 工具",
       Loading: "載入中...",
       ClientFailed: "MCP 客戶端載入失敗，靜默處理",
       ToolsCount: (count: number) => `${count} 個工具`,
+      Running: "執行中",
+      Done: "已完成",
+      Failed: "執行失敗",
+      Arguments: "Arguments",
+      Response: "Response",
+      EmptyArguments: "無參數",
     },
     Rename: "重新命名對話",
     Typing: "正在輸入…",
@@ -205,6 +224,14 @@ const tw = {
       Title: "包含角色範本上下文",
       SubTitle: "是否在訊息中顯示角色範本上下文",
     },
+    ShowHeader: {
+      Title: "顯示頭部資訊",
+      SubTitle: "是否在匯出預覽中顯示聊天頭部資訊",
+    },
+    ShowDetailedToken: {
+      Title: "顯示詳細 Token 資訊",
+      SubTitle: "開啟後顯示時間、Tokens、T/s、FT 與 TT；關閉時僅顯示時間",
+    },
     Steps: {
       Select: "選取",
       Preview: "預覽",
@@ -242,10 +269,16 @@ const tw = {
     Title: "設定",
     SubTitle: "設定選項",
     ShowPassword: "顯示密碼",
+    MultiModel: {
+      Title: "多模型功能",
+      SubTitle:
+        "控制聊天區是否顯示多模型按鈕。即使此處啟用，仍需在聊天區內再單獨切換當前會話的多模型模式。",
+    },
 
     Tab: {
       General: "通用設定",
       Sync: "雲端同步",
+      Mcp: "MCP",
       Mask: "角色助手",
       Prompt: "提示詞",
       ModelService: "模型服務",
@@ -779,6 +812,109 @@ const tw = {
       Temperature: {
         Title: "隨機性 (temperature)",
         SubTitle: "值越大，回應越隨機",
+      },
+    },
+    Mcp: {
+      Title: "MCP 服務",
+      SubTitle: "集中管理 MCP 服務、工具開關與連線設定",
+      Global: {
+        Title: "啟用 MCP 工具能力",
+        SubTitle:
+          "關閉後不會向模型注入任何 MCP 原生工具；開啟後只會注入已啟用服務中的已啟用工具",
+      },
+      SearchPlaceholder: "搜尋 MCP 服務或工具",
+      Empty: "尚未設定 MCP 服務",
+      EmptyDescription:
+        "新增一個 Streamable HTTP MCP 服務後，即可在聊天中使用其工具",
+      Tools: "工具",
+      ToolsCount: (count: number, enabled: number) =>
+        `${enabled}/${count} 個工具已啟用`,
+      NoDescription: "暫無描述",
+      Disabled: "已停用",
+      Enabled: "已啟用",
+      Status: {
+        active: "運行中",
+        paused: "已暫停",
+        initializing: "初始化中",
+        error: "異常",
+        undefined: "未初始化",
+      },
+      Actions: {
+        Add: "新增 MCP 服務",
+        Import: "匯入 JSON",
+        Edit: "編輯",
+        Test: "測試",
+        Start: "啟動",
+        Stop: "暫停",
+        Delete: "刪除",
+        RestartAll: "全部重啟",
+        ViewResponse: "查看結果",
+      },
+      Modal: {
+        AddTitle: "新增 MCP 服務",
+        EditTitle: "編輯 MCP 服務",
+        ImportTitle: "匯入 MCP 設定",
+        TestTitle: (name: string) => `連線測試 - ${name}`,
+        DeleteConfirm: (name: string) => `確認刪除 MCP 服務「${name}」？`,
+      },
+      Form: {
+        Id: {
+          Title: "服務識別",
+          SubTitle: "唯一識別，用於區分不同 MCP 服務",
+          Placeholder: "life-service",
+        },
+        Name: {
+          Title: "顯示名稱",
+          SubTitle: "用於設定頁與聊天中的顯示名稱",
+          Placeholder: "生活服務",
+        },
+        Description: {
+          Title: "描述",
+          SubTitle: "用來說明這個 MCP 服務的主要能力",
+          Placeholder: "天氣、出行等生活服務工具",
+        },
+        Type: {
+          Title: "傳輸類型",
+          SubTitle: "目前僅支援 Streamable HTTP",
+        },
+        BaseUrl: {
+          Title: "服務位址",
+          SubTitle:
+            "例如：https://example.com/mcp 或 http://host:port/mcp/name",
+          Placeholder: "https://host/mcp",
+        },
+        Headers: {
+          Title: "請求標頭",
+          SubTitle: "支援 JSON 或 key=value 多行格式",
+          Placeholder: "Authorization=Bearer token\nX-Api-Key=demo-key",
+        },
+        LongRunning: {
+          Title: "長任務模式",
+          SubTitle: "啟用後會將逾時至少提升到 600 秒，適合耗時工具",
+        },
+        Timeout: {
+          Title: "逾時時間",
+          SubTitle: "單位：秒",
+        },
+        Import: {
+          Title: "設定 JSON",
+          SubTitle: "可貼上包含 mcpServers 的 JSON 設定",
+          Placeholder:
+            '{\n  "mcpServers": {\n    "life-service": {\n      "type": "streamableHttp",\n      "baseUrl": "https://host/mcp/life-service"\n    }\n  }\n}',
+        },
+      },
+      Toast: {
+        Added: "MCP 服務已新增",
+        Updated: "MCP 服務已更新",
+        Imported: "MCP 設定已匯入",
+        Deleted: "MCP 服務已刪除",
+        Paused: "MCP 服務已暫停",
+        Resumed: "MCP 服務已啟動",
+        Restarted: "已觸發全部 MCP 重啟",
+        TestFailed: "連線測試失敗",
+        SaveFailed: "儲存失敗，請檢查設定",
+        ImportFailed: "JSON 解析失敗或內容無效",
+        LoadToolsFailed: "載入工具列表失敗",
       },
     },
   },
