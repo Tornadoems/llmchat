@@ -56,7 +56,6 @@ jobs:
           platforms: linux/amd64
           push: true
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ env.REGISTRY }}/${{ steps.prep.outputs.image }}:build-amd64
           outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=docker-amd64
           cache-to: type=gha,mode=max,scope=docker-amd64
@@ -109,7 +108,6 @@ jobs:
           platforms: linux/arm64
           push: true
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ env.REGISTRY }}/${{ steps.prep.outputs.image }}:build-arm64
           outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=docker-arm64
           cache-to: type=gha,mode=max,scope=docker-arm64
