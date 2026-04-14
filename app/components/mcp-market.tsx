@@ -44,7 +44,7 @@ export function McpMarketPage() {
   const [searchText, setSearchText] = useState("");
   const [userConfig, setUserConfig] = useState<Record<string, any>>({});
   const [editingServerId, setEditingServerId] = useState<string | undefined>();
-  const [tools, setTools] = useState<ListToolsResponse["tools"] | null>(null);
+  const [tools, setTools] = useState<ListToolsResponse | null>(null);
   const [viewingServerId, setViewingServerId] = useState<string | undefined>();
   const [isLoading, setIsLoading] = useState(false);
   const [config, setConfig] = useState<McpConfigData>();
@@ -863,7 +863,10 @@ export function McpMarketPage() {
                   <div>Loading...</div>
                 ) : tools?.tools ? (
                   tools.tools.map(
-                    (tool: ListToolsResponse["tools"], index: number) => (
+                    (
+                      tool: ListToolsResponse["tools"][number],
+                      index: number,
+                    ) => (
                       <div key={index} className={styles["tool-item"]}>
                         <div className={styles["tool-name"]}>{tool.name}</div>
                         <div className={styles["tool-description"]}>
